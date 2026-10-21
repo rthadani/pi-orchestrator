@@ -1,6 +1,6 @@
 /**
  * pi-orchestrator: inject the failover.json model catalog and, when the user has
- * no ORCHESTRATOR.md, a condensed default workflow into the system prompt.
+ * no ORCHESTRATOR.md, the full default workflow into the system prompt.
  *
  * The workflow file names capability classes (opus, sonnet, flash, coding)
  * rather than models; the roster section lists which models each class contains.
@@ -8,6 +8,8 @@
  * agent dir, nearest first) replaces the packaged default outright; the two are
  * never injected together. pi loads its own context files separately, so those
  * do not suppress this workflow. The roster is always injected from failover.json.
+ * The workflow asset is always injected in full, never filtered by which tools
+ * are installed; /workflow doctor reports the extensions it expects.
  *
  * Warning: a class name is not a model string. Pass `failover/<model-name>`;
  * `failover/<class>` does not resolve to that class and falls back to the
@@ -341,71 +343,23 @@ interface CapabilityDef {
   capability: string;
   tools: string[];
   install: string;
+  required: boolean;
 }
 
-/** Capabilities gate only the shipped default asset; user files are never filtered. */
+/** Extensions the workflow relies on; the first three are required, ask_user is optional. */
 const CAPABILITY_DEFS: CapabilityDef[] = [
-  { capability: "subagent", tools: ["subagent"], install: "pi install npm:pi-subagents" },
-  { capability: "boomerang", tools: ["boomerang"], install: "pi install npm:pi-boomerang" },
+  { capability: "pi-subagents", tools: ["subagent"], install: "pi install npm:pi-subagents", required: true },
+  { capability: "pi-boomerang", tools: ["boomerang"], install: "pi install npm:pi-boomerang", required: true },
   {
     capability: "context-mode",
     tools: ["ctx_execute", "ctx_batch_execute", "ctx_search"],
     install: "pi install npm:context-mode",
+    required: true,
   },
-  { capability: "ask_user", tools: ["ask_user"], install: "pi install npm:pi-ask-user" },
+  { capability: "ask_user", tools: ["ask_user"], install: "pi install npm:pi-ask-user", required: false },
 ];
 
-const KNOWN_CAPABILITIES = new Set(CAPABILITY_DEFS.map((def) => def.capability));
-
-const OPEN_MARKER = /^\s*<!--\s*requires:\s*([^>]+?)\s*-->\s*$/;
-const CLOSE_MARKER = /^\s*<!--\s*\/requires\s*-->\s*$/;
-
-/**
- * Remove every `<!-- requires: ... -->` block whose capabilities are not all
- * present. Unmarked text is untouched; markers are always stripped. Unclosed or
- * malformed markers are left in place so a bad marker never eats content.
- */
-export function filterByCapabilities(text: string, available: ReadonlySet<string>): string {
-  const lines = text.split("\n");
-  const out: string[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    const open = OPEN_MARKER.exec(lines[i]);
-    if (open === null) {
-      out.push(lines[i]);
-      i += 1;
-      continue;
-    }
-    const caps = open[1]
-      .split(",")
-      .map((cap) => cap.trim())
-      .filter((cap) => cap.length > 0);
-    if (caps.length === 0) {
-      out.push(lines[i]);
-      i += 1;
-      continue;
-    }
-    const close = lines.findIndex((line, index) => index > i && CLOSE_MARKER.test(line));
-    if (close === -1) {
-      out.push(lines[i]);
-      i += 1;
-      continue;
-    }
-    const unknown = caps.some((cap) => !KNOWN_CAPABILITIES.has(cap));
-    if (unknown) {
-      for (let k = i; k <= close; k += 1) out.push(lines[k]);
-      i = close + 1;
-      continue;
-    }
-    if (caps.every((cap) => available.has(cap))) {
-      for (let k = i + 1; k < close; k += 1) out.push(lines[k]);
-    }
-    i = close + 1;
-  }
-  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-/** Capability names whose required tools are present, per the pi tool list. */
+/** Extension names whose required tools are present, per the pi tool list. */
 export function detectCapabilities(hasTool: (name: string) => boolean): Set<string> {
   const present = new Set<string>();
   for (const def of CAPABILITY_DEFS) {
@@ -440,13 +394,14 @@ function detectTools(pi: ExtensionAPI): ReadonlySet<string> | null {
   if (names === null && !warnedToolDetection) {
     warnedToolDetection = true;
     console.warn(
-      "[pi-orchestrator] tool detection unavailable; injecting the full default workflow without capability filtering",
+      "[pi-orchestrator] tool detection unavailable; /workflow doctor cannot audit extensions",
     );
   }
   return names;
 }
 
 export interface DoctorState {
+  /** Extension names detected as present, from detectCapabilities. */
   available: ReadonlySet<string>;
   workflowSource: "user" | "default";
   workflowPath: string;
@@ -456,22 +411,45 @@ export interface DoctorState {
 
 /** Render the /workflow doctor report; pure so it can be exercised offline. */
 export function renderDoctorReport(state: DoctorState): string {
-  const lines: string[] = ["workflow capabilities"];
-  for (const def of CAPABILITY_DEFS) {
-    const tool = def.tools.find((name) => state.available.has(name));
-    if (tool) {
-      lines.push(`- ${def.capability}: present (${tool})`);
+  const lines: string[] = ["workflow extensions"];
+  const required = CAPABILITY_DEFS.filter((def) => def.required);
+  const optional = CAPABILITY_DEFS.filter((def) => !def.required);
+  const missingRequired = required.filter((def) => !state.available.has(def.capability));
+
+  if (missingRequired.length > 0) {
+    lines.push(
+      `MISSING REQUIRED: ${missingRequired
+        .map((def) => def.capability)
+        .join(", ")} — the workflow expects ${required.map((def) => def.capability).join(", ")}`,
+    );
+  } else {
+    lines.push("required extensions: all present");
+  }
+
+  for (const def of required) {
+    if (state.available.has(def.capability)) {
+      lines.push(`- ${def.capability}: present`);
     } else {
-      lines.push(`- ${def.capability}: missing — run \`${def.install}\``);
+      lines.push(`- ${def.capability}: missing — required; run \`${def.install}\``);
     }
   }
+  for (const def of optional) {
+    if (state.available.has(def.capability)) {
+      lines.push(`- ${def.capability}: present`);
+    } else {
+      lines.push(
+        `- ${def.capability}: optional — degrades gracefully (the one-question-at-a-time rule works without the tool)`,
+      );
+    }
+  }
+
   lines.push("");
   if (state.workflowSource === "user") {
     lines.push(
       `workflow override: user ORCHESTRATOR.md (${state.workflowPath}); injected verbatim, never filtered`,
     );
   } else {
-    lines.push("workflow override: none (packaged default, capability-filtered)");
+    lines.push("workflow override: none (packaged default, injected in full)");
   }
   lines.push("");
   if (state.failoverFound) {
@@ -486,25 +464,15 @@ export function renderDoctorReport(state: DoctorState): string {
 
 export default function piRoster(pi: ExtensionAPI): void {
   // Probe once at load so a pi without getAllTools warns immediately instead of
-  // silently running without capability filtering.
+  // silently skipping the doctor audit.
   detectTools(pi);
 
   pi.on("before_agent_start", (event) => {
     const rosterState = loadRoster();
     const workflowState = loadWorkflow();
-    let workflowText = workflowState.section;
-    // Filter ONLY the packaged default. A user ORCHESTRATOR.md is deliberate and
-    // injected verbatim, never filtered.
-    if (workflowState.source === "default" && workflowText) {
-      const available = detectTools(pi);
-      if (available !== null) {
-        workflowText = filterByCapabilities(
-          workflowText,
-          detectCapabilities((name) => available.has(name)),
-        );
-      }
-    }
-    const sections = renderDefaultSections(workflowText, rosterState);
+    // The workflow (user file or packaged default) is always injected in full,
+    // never filtered by which tools are installed.
+    const sections = renderDefaultSections(workflowState.section, rosterState);
 
     if (sections.workflow) {
       event.systemPromptOptions.sections.orchestrator_workflow = sections.workflow;
@@ -526,15 +494,16 @@ export default function piRoster(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("workflow", {
-    description: "Show workflow source and roster; `init` copies the template; `doctor` audits capabilities",
+    description: "Show workflow source and roster; `init` copies the template; `doctor` audits required extensions",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       if (tokens[0] === "doctor") {
-        const available = detectTools(pi);
-        if (available === null) {
-          ctx.ui.notify("tool detection unavailable; cannot audit workflow capabilities", "error");
+        const tools = detectTools(pi);
+        if (tools === null) {
+          ctx.ui.notify("tool detection unavailable; cannot audit workflow extensions", "error");
           return;
         }
+        const available = detectCapabilities((name) => tools.has(name));
         const workflow = loadWorkflow();
         const roster = loadRoster();
         ctx.ui.notify(

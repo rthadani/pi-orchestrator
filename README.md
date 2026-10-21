@@ -11,10 +11,10 @@ classes instead of hardcoding model names.
 Two sections are injected, and neither ever names a specific model.
 
 **Workflow.** The packaged default in `assets/ORCHESTRATOR.example.md` is
-injected unless you provide your own `ORCHESTRATOR.md` in the current
+injected in full unless you provide your own `ORCHESTRATOR.md` in the current
 directory, a parent, or the pi agent dir. Yours replaces the default outright.
-Blocks that need tools from other packages are gated on those tools being
-installed, so a bare install is never told to call a tool that does not exist.
+The workflow expects a few companion extensions; none are installed
+automatically, and `/workflow doctor` reports what is missing.
 
 **Model roster.** Read from your failover config and rendered one line per
 capability class, listing each class's models in failover order with
@@ -56,12 +56,13 @@ The `/roster` command prints exactly what would be injected, plus the config pat
 
 `/workflow` reports which workflow source won (your `ORCHESTRATOR.md` with its
 path, or the packaged default with its mtime); `/workflow init` copies the
-template to a file you own; `/workflow doctor` audits which capabilities are
-installed. Set `ORCHESTRATOR_DEBUG=1` to log the workflow report at load.
+template to a file you own; `/workflow doctor` audits which required
+extensions are installed. Set `ORCHESTRATOR_DEBUG=1` to log the workflow
+report at load.
 
 ## Default workflow
 
-The package ships a condensed default orchestration workflow (`assets/ORCHESTRATOR.example.md`). It is injected into the system prompt only when no `ORCHESTRATOR.md` is found. When you create one, it replaces the default outright: the default and your file are never both injected, so they cannot contradict each other.
+The package ships a full default orchestration workflow (`assets/ORCHESTRATOR.example.md`). It is injected into the system prompt only when no `ORCHESTRATOR.md` is found. When you create one, it replaces the default outright: the default and your file are never both injected, so they cannot contradict each other.
 
 Search order, nearest wins:
 
@@ -81,24 +82,31 @@ To start customizing, run:
 
 That copies the packaged example to `./ORCHESTRATOR.md` (or to a path you pass, e.g. `/workflow init /some/where/ORCHESTRATOR.md`). It refuses to overwrite an existing file. Edit the file, then restart or reload pi.
 
-A shipped-default-only setup needs nothing: with no `ORCHESTRATOR.md` anywhere, the packaged default is injected with capability filtering applied (see the next section). To disable the shipped default while keeping the roster, create an empty `ORCHESTRATOR.md`.
+A shipped-default-only setup needs nothing: with no `ORCHESTRATOR.md` anywhere, the packaged default is injected in full. To disable the shipped default while keeping the roster, create an empty `ORCHESTRATOR.md`.
 
 The shipped asset is not meant to be edited in place: package updates overwrite it. Use `/workflow init` to start a copy you own.
 
-## Capability-aware workflow
+## Required extensions
 
-The shipped default workflow adapts to what is actually installed. Blocks that depend on tools from other pi packages are wrapped in capability markers and are injected only when the matching tools are present, so a clean install never tells the model to call a tool that does not exist. Unmarked rules (plan before code, the carve-out list, token efficiency, the closing notes) are always injected.
+The workflow expects three companion extensions and treats one as optional.
+None of them are installed automatically by this package; `/workflow doctor`
+reports what is missing.
 
-| Capability | Needed for | Install when missing |
+| Extension | Why the workflow needs it | Install |
 | --- | --- | --- |
-| `subagent` | the oracle/worker/reviewer/scout/researcher roles | `pi install npm:pi-subagents` |
-| `boomerang` | long autonomous runs without raw output in context | `pi install npm:pi-boomerang` |
+| `pi-subagents` | the oracle/worker/reviewer/scout/researcher roles | `pi install npm:pi-subagents` |
 | `context-mode` | bulky-I/O rules via `ctx_execute`/`ctx_batch_execute`/`ctx_search` | `pi install npm:context-mode` |
-| `ask_user` | the one-focused-question rule | `pi install npm:pi-ask-user` |
+| `pi-boomerang` | long autonomous runs without raw output in context | `pi install npm:pi-boomerang` |
+| `ask_user` (optional) | the one-focused-question rule | `pi install npm:pi-ask-user` |
 
-A user `ORCHESTRATOR.md` is never filtered: it is injected verbatim, exactly as written, because you wrote it deliberately. Only the packaged default asset is capability-filtered.
+`pi-subagents`, `context-mode`, and `pi-boomerang` are required: when one is
+missing, `/workflow doctor` reports it as missing and required. `ask_user` is
+optional and degrades gracefully, because the one-question-at-a-time rule can
+be followed without the tool.
 
-Run `/workflow doctor` to audit what is missing. It reports each capability, which tool satisfied it, and the exact install command for each gap. If no failover config exists it also recommends `pi install git:github.com/rthadani/pi-failover` as the model provider.
+The full workflow asset is always injected, regardless of which extensions
+are installed; it is never filtered or gated. A user `ORCHESTRATOR.md` is also
+injected verbatim, exactly as written.
 
 ## What it deliberately does not do
 
