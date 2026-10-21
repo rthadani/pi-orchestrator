@@ -52,7 +52,7 @@ function inOrder(line, names) {
 // FAILOVER_CONFIG from the environment.
 delete process.env.FAILOVER_CONFIG;
 
-const { renderRoster, loadRoster, findOrchestratorFile, renderDefaultSections, loadWorkflow, default: piRoster } = await import("../extensions/pi-orchestrator.ts");
+const { renderRoster, loadRoster, findOrchestratorFile, renderDefaultSections, loadWorkflow, filterByCapabilities, detectCapabilities, renderDoctorReport, default: piRoster } = await import("../extensions/pi-orchestrator.ts");
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -491,6 +491,173 @@ await runCaseAsync("CASE 27: /workflow init writes the template and refuses to o
 
   rmSync(dir, { recursive: true, force: true });
   rmSync(dir2, { recursive: true, force: true });
+});
+
+runCase("CASE 28: filterByCapabilities removes a missing-capability block and keeps a present one", () => {
+  const text = [
+    "before",
+    "<!-- requires: boomerang -->",
+    "boom",
+    "<!-- /requires -->",
+    "<!-- requires: subagent -->",
+    "sub",
+    "<!-- /requires -->",
+    "after",
+  ].join("\n");
+  const out = filterByCapabilities(text, new Set(["subagent"]));
+  assert(!out.includes("boom"), `boomerang block should be removed:\n${out}`);
+  assert(out.includes("sub"), `subagent block should be kept:\n${out}`);
+  assert(out.includes("before") && out.includes("after"), `unmarked text must survive:\n${out}`);
+});
+
+runCase("CASE 29: a two-capability block is kept only when both are present", () => {
+  const text = [
+    "<!-- requires: subagent, ask_user -->",
+    "both",
+    "<!-- /requires -->",
+  ].join("\n");
+  assert(
+    filterByCapabilities(text, new Set(["subagent", "ask_user"])).includes("both"),
+    "both capabilities present should keep the block",
+  );
+  assert(
+    !filterByCapabilities(text, new Set(["subagent"])).includes("both"),
+    "one missing capability should remove the block",
+  );
+});
+
+runCase("CASE 30: unmarked text passes through unchanged", () => {
+  const text = "plain text\nwith a couple of lines\n\nand a blank line";
+  assert(filterByCapabilities(text, new Set()) === text, "unmarked text was altered");
+});
+
+runCase("CASE 31: an unclosed marker does not delete the content after it", () => {
+  const text = [
+    "<!-- requires: x -->",
+    "keep me",
+    "and me",
+  ].join("\n");
+  const out = filterByCapabilities(text, new Set());
+  assert(out.includes("keep me") && out.includes("and me"), `unclosed marker ate content:\n${out}`);
+});
+
+runCase("CASE 32: filtered output contains no runs of three or more newlines", () => {
+  const text = [
+    "top",
+    "",
+    "<!-- requires: boomerang -->",
+    "boom",
+    "<!-- /requires -->",
+    "",
+    "",
+    "bottom",
+  ].join("\n");
+  const out = filterByCapabilities(text, new Set());
+  assert(!/\n{3,}/.test(out), `three-plus newline run survived filtering:\n${JSON.stringify(out)}`);
+});
+
+runCase("CASE 33: a user ORCHESTRATOR.md is injected verbatim even when capabilities are missing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-orch-verbatim-"));
+  const userText = "# my workflow\n<!-- requires: boomerang -->\nkeep this tool line\n<!-- /requires -->";
+  writeFileSync(join(dir, "ORCHESTRATOR.md"), userText);
+
+  const prevCwd = process.cwd();
+  process.chdir(dir);
+  let onBefore;
+  try {
+    const pi = {
+      getAllTools: () => [],
+      on(event, cb) {
+        if (event === "before_agent_start") onBefore = cb;
+      },
+      registerCommand() {},
+    };
+    piRoster(pi);
+    assert(onBefore, "before_agent_start handler was not registered");
+    const sections = {};
+    onBefore({ systemPromptOptions: { sections } });
+    assert(
+      sections.orchestrator_workflow === userText,
+      `user workflow was filtered instead of injected verbatim:\n${sections.orchestrator_workflow}`,
+    );
+  } finally {
+    process.chdir(prevCwd);
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+runCase("CASE 34: shipped asset injects every block with full capabilities and only the unmarked core with none", () => {
+  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+  const full = filterByCapabilities(asset, new Set(["subagent", "boomerang", "context-mode", "ask_user"]));
+  for (const needle of ["## Steps", "## Agent roles", "## Model selection", "oracle", "worker", "reviewer", "scout", "researcher", "boomerang", "ctx_execute", "ask_user"]) {
+    assert(full.includes(needle), `full capabilities should keep ${needle}:\n${full}`);
+  }
+  assert(!full.includes("<!-- requires:"), `markers should be stripped from injected output:\n${full}`);
+
+  const empty = filterByCapabilities(asset, new Set());
+  for (const needle of ["# Workflow", "## Carve-outs", "## Token efficiency", "## Notes", "Keep bulky I/O", "Prefer LSP queries"]) {
+    assert(empty.includes(needle), `no capabilities should keep unmarked ${needle}:\n${empty}`);
+  }
+  for (const needle of ["oracle", "worker", "reviewer", "boomerang", "ctx_execute", "ask_user"]) {
+    assert(!empty.includes(needle), `no capabilities should drop ${needle}:\n${empty}`);
+  }
+});
+
+runCase("CASE 35: shipped asset has no model or provider names, no failover/, and only known balanced markers", () => {
+  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+  assert(
+    !/kimi|deepseek|glm|minimax|moonshot|anthropic|openai|failover\//i.test(asset),
+    "asset leaks a model or provider name or failover/",
+  );
+  const known = ["subagent", "boomerang", "context-mode", "ask_user"];
+  const opens = [...asset.matchAll(/<!--\s*requires:\s*([^>]+?)\s*-->/g)].map((m) => m[1]);
+  assert(opens.length > 0, "asset should contain capability markers");
+  for (const caps of opens) {
+    for (const cap of caps.split(",").map((s) => s.trim())) {
+      assert(known.includes(cap), `unknown capability in asset: ${cap}`);
+    }
+  }
+  const openCount = asset.split("\n").filter((l) => /<!--\s*requires:/.test(l)).length;
+  const closeCount = asset.split("\n").filter((l) => /<!--\s*\/requires\s*-->/.test(l)).length;
+  assert(openCount === closeCount, `unbalanced markers: ${openCount} opens vs ${closeCount} closes`);
+});
+
+runCase("CASE 36: doctor report lists an install command for each missing capability", () => {
+  const report = renderDoctorReport({
+    available: new Set(),
+    workflowSource: "default",
+    workflowPath: "/assets/ORCHESTRATOR.example.md",
+    failoverFound: false,
+    failoverPath: "/none/failover.json",
+  });
+  for (const cmd of [
+    "pi install npm:pi-subagents",
+    "pi install npm:pi-boomerang",
+    "pi install npm:context-mode",
+    "pi install npm:pi-ask-user",
+  ]) {
+    assert(report.includes(cmd), `doctor report missing install command ${cmd}:\n${report}`);
+  }
+  assert(
+    report.includes("pi install git:github.com/rthadani/pi-failover"),
+    `doctor report missing failover recommendation:\n${report}`,
+  );
+});
+
+runCase("CASE 37: detectCapabilities maps tools to the four capabilities", () => {
+  const none = detectCapabilities(() => false);
+  assert(none.size === 0, `expected no capabilities, got ${[...none]}`);
+
+  const full = detectCapabilities((name) =>
+    ["subagent", "boomerang", "ctx_execute", "ask_user"].includes(name),
+  );
+  assert(
+    full.size === 4 && full.has("subagent") && full.has("boomerang") && full.has("context-mode") && full.has("ask_user"),
+    `unexpected capabilities: ${[...full]}`,
+  );
+
+  const ctx = detectCapabilities((name) => name === "ctx_search");
+  assert(ctx.size === 1 && ctx.has("context-mode"), `ctx_search should enable context-mode: ${[...ctx]}`);
 });
 
 rmSync(tmp, { recursive: true, force: true });

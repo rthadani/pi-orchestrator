@@ -337,11 +337,174 @@ if (process.env.ORCHESTRATOR_DEBUG) {
   console.log(`[pi-orchestrator]\n${workflowReport()}`);
 }
 
+interface CapabilityDef {
+  capability: string;
+  tools: string[];
+  install: string;
+}
+
+/** Capabilities gate only the shipped default asset; user files are never filtered. */
+const CAPABILITY_DEFS: CapabilityDef[] = [
+  { capability: "subagent", tools: ["subagent"], install: "pi install npm:pi-subagents" },
+  { capability: "boomerang", tools: ["boomerang"], install: "pi install npm:pi-boomerang" },
+  {
+    capability: "context-mode",
+    tools: ["ctx_execute", "ctx_batch_execute", "ctx_search"],
+    install: "pi install npm:context-mode",
+  },
+  { capability: "ask_user", tools: ["ask_user"], install: "pi install npm:pi-ask-user" },
+];
+
+const KNOWN_CAPABILITIES = new Set(CAPABILITY_DEFS.map((def) => def.capability));
+
+const OPEN_MARKER = /^\s*<!--\s*requires:\s*([^>]+?)\s*-->\s*$/;
+const CLOSE_MARKER = /^\s*<!--\s*\/requires\s*-->\s*$/;
+
+/**
+ * Remove every `<!-- requires: ... -->` block whose capabilities are not all
+ * present. Unmarked text is untouched; markers are always stripped. Unclosed or
+ * malformed markers are left in place so a bad marker never eats content.
+ */
+export function filterByCapabilities(text: string, available: ReadonlySet<string>): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const open = OPEN_MARKER.exec(lines[i]);
+    if (open === null) {
+      out.push(lines[i]);
+      i += 1;
+      continue;
+    }
+    const caps = open[1]
+      .split(",")
+      .map((cap) => cap.trim())
+      .filter((cap) => cap.length > 0);
+    if (caps.length === 0) {
+      out.push(lines[i]);
+      i += 1;
+      continue;
+    }
+    const close = lines.findIndex((line, index) => index > i && CLOSE_MARKER.test(line));
+    if (close === -1) {
+      out.push(lines[i]);
+      i += 1;
+      continue;
+    }
+    const unknown = caps.some((cap) => !KNOWN_CAPABILITIES.has(cap));
+    if (unknown) {
+      for (let k = i; k <= close; k += 1) out.push(lines[k]);
+      i = close + 1;
+      continue;
+    }
+    if (caps.every((cap) => available.has(cap))) {
+      for (let k = i + 1; k < close; k += 1) out.push(lines[k]);
+    }
+    i = close + 1;
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/** Capability names whose required tools are present, per the pi tool list. */
+export function detectCapabilities(hasTool: (name: string) => boolean): Set<string> {
+  const present = new Set<string>();
+  for (const def of CAPABILITY_DEFS) {
+    if (def.tools.some((name) => hasTool(name))) present.add(def.capability);
+  }
+  return present;
+}
+
+let warnedToolDetection = false;
+
+/** Best-effort tool names from pi; null when getAllTools is absent or throws. */
+function collectToolNames(pi: ExtensionAPI): ReadonlySet<string> | null {
+  try {
+    const getAll = (pi as unknown as { getAllTools?: () => unknown }).getAllTools;
+    if (typeof getAll !== "function") return null;
+    const tools = getAll();
+    if (!Array.isArray(tools)) return null;
+    const names = new Set<string>();
+    for (const tool of tools) {
+      const name = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
+      if (typeof name === "string") names.add(name);
+    }
+    return names;
+  } catch {
+    return null;
+  }
+}
+
+/** Tool names plus a single load-time warning when detection is impossible. */
+function detectTools(pi: ExtensionAPI): ReadonlySet<string> | null {
+  const names = collectToolNames(pi);
+  if (names === null && !warnedToolDetection) {
+    warnedToolDetection = true;
+    console.warn(
+      "[pi-orchestrator] tool detection unavailable; injecting the full default workflow without capability filtering",
+    );
+  }
+  return names;
+}
+
+export interface DoctorState {
+  available: ReadonlySet<string>;
+  workflowSource: "user" | "default";
+  workflowPath: string;
+  failoverFound: boolean;
+  failoverPath: string;
+}
+
+/** Render the /workflow doctor report; pure so it can be exercised offline. */
+export function renderDoctorReport(state: DoctorState): string {
+  const lines: string[] = ["workflow capabilities"];
+  for (const def of CAPABILITY_DEFS) {
+    const tool = def.tools.find((name) => state.available.has(name));
+    if (tool) {
+      lines.push(`- ${def.capability}: present (${tool})`);
+    } else {
+      lines.push(`- ${def.capability}: missing — run \`${def.install}\``);
+    }
+  }
+  lines.push("");
+  if (state.workflowSource === "user") {
+    lines.push(
+      `workflow override: user ORCHESTRATOR.md (${state.workflowPath}); injected verbatim, never filtered`,
+    );
+  } else {
+    lines.push("workflow override: none (packaged default, capability-filtered)");
+  }
+  lines.push("");
+  if (state.failoverFound) {
+    lines.push(`failover config: found (${state.failoverPath})`);
+  } else {
+    lines.push(
+      `failover config: not found — install a model provider with \`pi install git:github.com/rthadani/pi-failover\``,
+    );
+  }
+  return lines.join("\n");
+}
+
 export default function piRoster(pi: ExtensionAPI): void {
+  // Probe once at load so a pi without getAllTools warns immediately instead of
+  // silently running without capability filtering.
+  detectTools(pi);
+
   pi.on("before_agent_start", (event) => {
     const rosterState = loadRoster();
     const workflowState = loadWorkflow();
-    const sections = renderDefaultSections(workflowState.section, rosterState);
+    let workflowText = workflowState.section;
+    // Filter ONLY the packaged default. A user ORCHESTRATOR.md is deliberate and
+    // injected verbatim, never filtered.
+    if (workflowState.source === "default" && workflowText) {
+      const available = detectTools(pi);
+      if (available !== null) {
+        workflowText = filterByCapabilities(
+          workflowText,
+          detectCapabilities((name) => available.has(name)),
+        );
+      }
+    }
+    const sections = renderDefaultSections(workflowText, rosterState);
 
     if (sections.workflow) {
       event.systemPromptOptions.sections.orchestrator_workflow = sections.workflow;
@@ -363,9 +526,29 @@ export default function piRoster(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("workflow", {
-    description: "Show which workflow source won and the model roster; `init` copies the template",
+    description: "Show workflow source and roster; `init` copies the template; `doctor` audits capabilities",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
+      if (tokens[0] === "doctor") {
+        const available = detectTools(pi);
+        if (available === null) {
+          ctx.ui.notify("tool detection unavailable; cannot audit workflow capabilities", "error");
+          return;
+        }
+        const workflow = loadWorkflow();
+        const roster = loadRoster();
+        ctx.ui.notify(
+          renderDoctorReport({
+            available,
+            workflowSource: workflow.source,
+            workflowPath: workflow.path,
+            failoverFound: roster.disabled !== "config file missing",
+            failoverPath: roster.path,
+          }),
+          "info",
+        );
+        return;
+      }
       if (tokens[0] === "init") {
         const target = tokens[1]
           ? resolve(ctx.cwd, tokens.slice(1).join(" "))

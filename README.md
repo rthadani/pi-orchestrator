@@ -60,9 +60,24 @@ To start customizing, run:
 
 That copies the packaged example to `./ORCHESTRATOR.md` (or to a path you pass, e.g. `/workflow init /some/where/ORCHESTRATOR.md`). It refuses to overwrite an existing file. Edit the file, then restart or reload pi.
 
-A shipped-default-only setup needs nothing: with no `ORCHESTRATOR.md` anywhere, the packaged default is injected as-is. To disable the shipped default while keeping the roster, create an empty `ORCHESTRATOR.md`.
+A shipped-default-only setup needs nothing: with no `ORCHESTRATOR.md` anywhere, the packaged default is injected with capability filtering applied (see the next section). To disable the shipped default while keeping the roster, create an empty `ORCHESTRATOR.md`.
 
 The shipped asset is not meant to be edited in place: package updates overwrite it. Use `/workflow init` to start a copy you own.
+
+## Capability-aware workflow
+
+The shipped default workflow adapts to what is actually installed. Blocks that depend on tools from other pi packages are wrapped in capability markers and are injected only when the matching tools are present, so a clean install never tells the model to call a tool that does not exist. Unmarked rules (plan before code, the carve-out list, token efficiency, the closing notes) are always injected.
+
+| Capability | Needed for | Install when missing |
+| --- | --- | --- |
+| `subagent` | the oracle/worker/reviewer/scout/researcher roles | `pi install npm:pi-subagents` |
+| `boomerang` | long autonomous runs without raw output in context | `pi install npm:pi-boomerang` |
+| `context-mode` | bulky-I/O rules via `ctx_execute`/`ctx_batch_execute`/`ctx_search` | `pi install npm:context-mode` |
+| `ask_user` | the one-focused-question rule | `pi install npm:pi-ask-user` |
+
+A user `ORCHESTRATOR.md` is never filtered: it is injected verbatim, exactly as written, because you wrote it deliberately. Only the packaged default asset is capability-filtered.
+
+Run `/workflow doctor` to audit what is missing. It reports each capability, which tool satisfied it, and the exact install command for each gap. If no failover config exists it also recommends `pi install git:github.com/rthadani/pi-failover` as the model provider.
 
 ## What it deliberately does not do
 
