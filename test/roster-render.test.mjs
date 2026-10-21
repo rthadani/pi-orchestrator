@@ -52,7 +52,7 @@ function inOrder(line, names) {
 // FAILOVER_CONFIG from the environment.
 delete process.env.FAILOVER_CONFIG;
 
-const { renderRoster, loadRoster, findOrchestratorFile, renderDefaultSections, loadWorkflow, detectCapabilities, renderDoctorReport, default: piRoster } = await import("../extensions/pi-orchestrator.ts");
+const { renderRoster, loadRoster, findOrchestratorFile, renderDefaultSections, loadWorkflow, detectExtensions, missingRequired, renderDoctorReport, default: piRoster } = await import("../extensions/pi-orchestrator.ts");
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -525,125 +525,226 @@ runCase("CASE 29: shipped asset retains the full workflow detail", () => {
   }
 });
 
-runCase("CASE 30: shipped asset injects in full regardless of detected tools", () => {
-  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
-  const dir = mkdtempSync(join(tmpdir(), "pi-orch-full-"));
+// Exercise the before_agent_start handler with a controlled installed-package
+// set (settings.json `packages`) and model-registry provider set. Returns the
+// injected workflow and roster sections (undefined when omitted).
+function injectWorkflow({ packages = [], providers = [], userFile = null, settings = null }) {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-orch-agent-"));
+  const workDir = mkdtempSync(join(tmpdir(), "pi-orch-work-"));
+  if (userFile !== null) writeFileSync(join(workDir, "ORCHESTRATOR.md"), userFile);
+  writeFileSync(
+    join(agentDir, "settings.json"),
+    settings !== null ? settings : JSON.stringify({ packages }),
+  );
   const prevCwd = process.cwd();
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.chdir(dir);
-  process.env.PI_CODING_AGENT_DIR = dir;
-  try {
-    const injectWith = (tools) => {
-      let onBefore;
-      const pi = {
-        getAllTools: () => tools.map((name) => ({ name })),
-        on(event, cb) {
-          if (event === "before_agent_start") onBefore = cb;
-        },
-        registerCommand() {},
-      };
-      piRoster(pi);
-      assert(onBefore, "before_agent_start handler was not registered");
-      const sections = {};
-      onBefore({ systemPromptOptions: { sections } });
-      return sections.orchestrator_workflow;
-    };
-    const empty = injectWith([]);
-    const full = injectWith(["subagent", "boomerang", "ctx_execute", "ctx_search", "ask_user"]);
-    assert(empty === asset, "empty tool set must still inject the full asset");
-    assert(full === asset, "full tool set must inject the full asset");
-    assert(empty === full, "injected workflow must not vary with detected tools");
-    assert(empty.length > 0, "injected workflow is empty");
-  } finally {
-    process.chdir(prevCwd);
-    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
-  }
-  rmSync(dir, { recursive: true, force: true });
-});
-
-runCase("CASE 33: a user ORCHESTRATOR.md is injected verbatim even when capabilities are missing", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-orch-verbatim-"));
-  const userText = "# my workflow\n<!-- requires: boomerang -->\nkeep this tool line\n<!-- /requires -->";
-  writeFileSync(join(dir, "ORCHESTRATOR.md"), userText);
-
-  const prevCwd = process.cwd();
-  process.chdir(dir);
+  process.chdir(workDir);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   let onBefore;
-  try {
-    const pi = {
-      getAllTools: () => [],
-      on(event, cb) {
-        if (event === "before_agent_start") onBefore = cb;
-      },
-      registerCommand() {},
-    };
-    piRoster(pi);
-    assert(onBefore, "before_agent_start handler was not registered");
-    const sections = {};
-    onBefore({ systemPromptOptions: { sections } });
-    assert(
-      sections.orchestrator_workflow === userText,
-      `user workflow was filtered instead of injected verbatim:\n${sections.orchestrator_workflow}`,
-    );
-  } finally {
-    process.chdir(prevCwd);
-  }
-  rmSync(dir, { recursive: true, force: true });
+  const pi = {
+    on(event, cb) {
+      if (event === "before_agent_start") onBefore = cb;
+    },
+    registerCommand() {},
+  };
+  piRoster(pi);
+  assert(onBefore, "before_agent_start handler was not registered");
+  const ctx = {
+    modelRegistry: {
+      getProvider: (name) => (providers.includes(name) ? { name } : undefined),
+    },
+  };
+  const sections = {};
+  onBefore({ systemPromptOptions: { sections } }, ctx);
+  const result = { workflow: sections.orchestrator_workflow, roster: sections.model_roster };
+  process.chdir(prevCwd);
+  if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+  rmSync(agentDir, { recursive: true, force: true });
+  rmSync(workDir, { recursive: true, force: true });
+  return result;
+}
+
+runCase("CASE 30: packaged workflow injects only when all four required extensions are installed", () => {
+  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+  const required = ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"];
+  const allPresent = injectWorkflow({ packages: required, providers: ["failover"] });
+  assert(allPresent.workflow === asset, "all required installed should inject the full asset");
+  const missing = injectWorkflow({ packages: required, providers: [] });
+  assert(missing.workflow === undefined, "missing pi-failover should withhold the workflow");
 });
 
-runCase("CASE 34: doctor marks the three required extensions distinctly from optional ask_user", () => {
+runCase("CASE 33: a user ORCHESTRATOR.md is injected verbatim even with all four required extensions missing", () => {
+  const userText = "# my workflow\ncustom rule\n";
+  const result = injectWorkflow({ packages: [], providers: [], userFile: userText });
+  assert(
+    result.workflow === userText,
+    `user workflow was withheld instead of injected verbatim:\n${result.workflow}`,
+  );
+});
+
+runCase("CASE 34: doctor marks the four required extensions and reports the withheld state", () => {
   const missing = renderDoctorReport({
     available: new Set(),
     workflowSource: "default",
     workflowPath: "/assets/ORCHESTRATOR.example.md",
     failoverFound: false,
     failoverPath: "/none/failover.json",
+    withheld: true,
+    toolsSeen: new Set(),
   });
   assert(missing.includes("MISSING REQUIRED"), `missing-required banner absent:\n${missing}`);
-  assert(missing.includes("the workflow expects"), `workflow-expects wording absent:\n${missing}`);
+  assert(
+    missing.includes("MISSING REQUIRED: pi-subagents, pi-boomerang, context-mode, pi-failover"),
+    `missing-required banner must name all four required:\n${missing}`,
+  );
   assert(missing.includes("pi-subagents: missing — required"), `subagents required line absent:\n${missing}`);
   assert(missing.includes("pi-boomerang: missing — required"), `boomerang required line absent:\n${missing}`);
   assert(missing.includes("context-mode: missing — required"), `context-mode required line absent:\n${missing}`);
+  assert(missing.includes("pi-failover: missing — required"), `failover required line absent:\n${missing}`);
   assert(missing.includes("pi install npm:pi-subagents"), `subagents install command absent:\n${missing}`);
   assert(missing.includes("pi install npm:pi-boomerang"), `boomerang install command absent:\n${missing}`);
   assert(missing.includes("pi install npm:context-mode"), `context-mode install command absent:\n${missing}`);
+  assert(missing.includes("pi install git:github.com/rthadani/pi-failover"), `failover install command absent:\n${missing}`);
+  assert(missing.includes("workflow status: WITHHELD"), `withheld state absent:\n${missing}`);
+  assert(missing.includes("runtime tools (informational, not a gate)"), `informational tools line absent:\n${missing}`);
   assert(
     missing.includes("ask_user: optional — degrades gracefully"),
     `ask_user optional degrade line absent:\n${missing}`,
   );
-  assert(
-    missing.includes("pi install git:github.com/rthadani/pi-failover"),
-    `failover recommendation absent:\n${missing}`,
-  );
 
   const present = renderDoctorReport({
-    available: new Set(["pi-subagents", "pi-boomerang", "context-mode", "ask_user"]),
+    available: new Set(["pi-subagents", "pi-boomerang", "context-mode", "pi-failover", "ask_user"]),
     workflowSource: "default",
     workflowPath: "/assets/ORCHESTRATOR.example.md",
     failoverFound: true,
     failoverPath: "/ok/failover.json",
+    withheld: false,
+    toolsSeen: new Set(["subagent", "boomerang", "ctx_execute", "ask_user"]),
   });
   assert(present.includes("required extensions: all present"), `all-present banner absent:\n${present}`);
   assert(present.includes("pi-subagents: present"), `subagents present line absent:\n${present}`);
+  assert(present.includes("pi-failover: present"), `failover present line absent:\n${present}`);
   assert(present.includes("ask_user: present"), `ask_user present line absent:\n${present}`);
+  assert(present.includes("workflow status: injecting"), `injecting state absent:\n${present}`);
+  assert(present.includes("subagent=seen"), `informational subagent seen line absent:\n${present}`);
   assert(!present.includes("MISSING REQUIRED"), `missing banner should not appear when all present:\n${present}`);
+  assert(!present.includes("WITHHELD"), `withheld should not appear when all present:\n${present}`);
 });
 
-runCase("CASE 35: detectCapabilities maps tools to the four extensions", () => {
-  const none = detectCapabilities(() => false);
+runCase("CASE 35: detectExtensions maps installed packages and providers to capabilities", () => {
+  const none = detectExtensions(() => false, () => false);
   assert(none.size === 0, `expected no extensions, got ${[...none]}`);
 
-  const full = detectCapabilities((name) =>
-    ["subagent", "boomerang", "ctx_execute", "ask_user"].includes(name),
+  const full = detectExtensions(
+    (name) => ["pi-subagents", "pi-boomerang", "context-mode", "pi-ask-user"].includes(name),
+    (name) => name === "failover",
   );
   assert(
-    full.size === 4 && full.has("pi-subagents") && full.has("pi-boomerang") && full.has("context-mode") && full.has("ask_user"),
+    full.size === 5 && full.has("pi-subagents") && full.has("pi-boomerang") && full.has("context-mode") && full.has("pi-failover") && full.has("ask_user"),
     `unexpected extensions: ${[...full]}`,
   );
 
-  const ctx = detectCapabilities((name) => name === "ctx_search");
-  assert(ctx.size === 1 && ctx.has("context-mode"), `ctx_search should enable context-mode: ${[...ctx]}`);
+  const contextOnly = detectExtensions((name) => name === "context-mode", () => false);
+  assert(contextOnly.size === 1 && contextOnly.has("context-mode"), `package should enable context-mode: ${[...contextOnly]}`);
+
+  const failoverOnly = detectExtensions(() => false, (name) => name === "failover");
+  assert(failoverOnly.size === 1 && failoverOnly.has("pi-failover"), `provider should enable pi-failover: ${[...failoverOnly]}`);
+});
+
+runCase("CASE 36: detectExtensions returns the four required capabilities only when predicates report present", () => {
+  const all = detectExtensions(() => true, () => true);
+  for (const cap of ["pi-subagents", "pi-boomerang", "context-mode", "pi-failover"]) {
+    assert(all.has(cap), `missing required capability ${cap}`);
+  }
+  assert(all.has("ask_user"), "ask_user should be present when its package is reported");
+
+  const packageSubset = detectExtensions(
+    (name) => ["pi-subagents", "pi-boomerang", "context-mode", "pi-ask-user"].includes(name),
+    () => false,
+  );
+  assert(
+    packageSubset.has("pi-subagents") && packageSubset.has("pi-boomerang") && packageSubset.has("context-mode") && packageSubset.has("ask_user"),
+    `package-only subset wrong: ${[...packageSubset]}`,
+  );
+  assert(!packageSubset.has("pi-failover"), "pi-failover must not be present without the provider");
+
+  const providerSubset = detectExtensions(() => false, (name) => name === "failover");
+  assert(providerSubset.size === 1 && providerSubset.has("pi-failover"), `provider-only subset wrong: ${[...providerSubset]}`);
+});
+
+runCase("CASE 37: the required set is exactly the four, with ask_user excluded", () => {
+  const required = missingRequired(new Set());
+  const names = required.map((def) => def.capability).sort();
+  assert(
+    names.join(",") === "context-mode,pi-boomerang,pi-failover,pi-subagents",
+    `unexpected required set: ${names.join(",")}`,
+  );
+  assert(!required.some((def) => def.capability === "ask_user"), "ask_user must not be required");
+});
+
+runCase("CASE 38: missing any one required extension withholds; installed packages without tools still inject", () => {
+  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+  const requiredPackages = ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"];
+  const cases = [
+    { missing: "pi-subagents", packages: ["npm:pi-boomerang", "npm:context-mode"], providers: ["failover"] },
+    { missing: "pi-boomerang", packages: ["npm:pi-subagents", "npm:context-mode"], providers: ["failover"] },
+    { missing: "context-mode", packages: ["npm:pi-subagents", "npm:pi-boomerang"], providers: ["failover"] },
+    { missing: "pi-failover", packages: requiredPackages, providers: [] },
+  ];
+  for (const c of cases) {
+    const result = injectWorkflow({ packages: c.packages, providers: c.providers });
+    assert(
+      result.workflow === undefined,
+      `missing ${c.missing} should withhold the workflow, got:\n${result.workflow}`,
+    );
+  }
+  const withoutAskUser = injectWorkflow({ packages: requiredPackages, providers: ["failover"] });
+  assert(withoutAskUser.workflow === asset, "missing ask_user alone must still inject the packaged workflow");
+
+  // Regression: packages installed but NO runtime tools registered must still inject.
+  const noTools = injectWorkflow({
+    packages: [...requiredPackages, "npm:pi-ask-user"],
+    providers: ["failover"],
+  });
+  assert(noTools.workflow === asset, "installed packages with no runtime tools must still inject");
+});
+
+runCase("CASE 39: unreadable settings or missing modelRegistry fails open and still injects", () => {
+  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+
+  const badSettings = injectWorkflow({ packages: [], providers: ["failover"], settings: "{ not json" });
+  assert(badSettings.workflow === asset, "unreadable settings should fail open and inject");
+
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-orch-failopen-"));
+  const workDir = mkdtempSync(join(tmpdir(), "pi-orch-failopenw-"));
+  writeFileSync(
+    join(agentDir, "settings.json"),
+    JSON.stringify({ packages: ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"] }),
+  );
+  const prevCwd = process.cwd();
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.chdir(workDir);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    let onBefore;
+    const pi = {
+      on(event, cb) {
+        if (event === "before_agent_start") onBefore = cb;
+      },
+      registerCommand() {},
+    };
+    piRoster(pi);
+    const sections = {};
+    onBefore({ systemPromptOptions: { sections } }, {});
+    assert(sections.orchestrator_workflow === asset, "missing modelRegistry should fail open and inject");
+  } finally {
+    process.chdir(prevCwd);
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+  }
+  rmSync(agentDir, { recursive: true, force: true });
+  rmSync(workDir, { recursive: true, force: true });
 });
 
 rmSync(tmp, { recursive: true, force: true });

@@ -11,10 +11,12 @@ classes instead of hardcoding model names.
 Two sections are injected, and neither ever names a specific model.
 
 **Workflow.** The packaged default in `assets/ORCHESTRATOR.example.md` is
-injected in full unless you provide your own `ORCHESTRATOR.md` in the current
-directory, a parent, or the pi agent dir. Yours replaces the default outright.
-The workflow expects a few companion extensions; none are installed
-automatically, and `/workflow doctor` reports what is missing.
+injected only when all four required companion extensions are installed;
+otherwise it is withheld (the roster still injects). Your own
+`ORCHESTRATOR.md` in the current directory, a parent, or the pi agent dir
+replaces the default outright and is always injected verbatim, never withheld.
+`/workflow doctor` reports what is present and whether the workflow is
+withheld.
 
 **Model roster.** Read from your failover config and rendered one line per
 capability class, listing each class's models in failover order with
@@ -57,8 +59,8 @@ The `/roster` command prints exactly what would be injected, plus the config pat
 `/workflow` reports which workflow source won (your `ORCHESTRATOR.md` with its
 path, or the packaged default with its mtime); `/workflow init` copies the
 template to a file you own; `/workflow doctor` audits which required
-extensions are installed. Set `ORCHESTRATOR_DEBUG=1` to log the workflow
-report at load.
+extensions are installed and whether the workflow is currently withheld or
+injecting. Set `ORCHESTRATOR_DEBUG=1` to log the workflow report at load.
 
 ## Default workflow
 
@@ -82,31 +84,39 @@ To start customizing, run:
 
 That copies the packaged example to `./ORCHESTRATOR.md` (or to a path you pass, e.g. `/workflow init /some/where/ORCHESTRATOR.md`). It refuses to overwrite an existing file. Edit the file, then restart or reload pi.
 
-A shipped-default-only setup needs nothing: with no `ORCHESTRATOR.md` anywhere, the packaged default is injected in full. To disable the shipped default while keeping the roster, create an empty `ORCHESTRATOR.md`.
+A shipped-default-only setup needs the four required extensions installed: with
+no `ORCHESTRATOR.md` anywhere, the packaged default is injected in full once
+they are present. To disable the shipped default while keeping the roster,
+create an empty `ORCHESTRATOR.md`.
 
 The shipped asset is not meant to be edited in place: package updates overwrite it. Use `/workflow init` to start a copy you own.
 
 ## Required extensions
 
-The workflow expects three companion extensions and treats one as optional.
-None of them are installed automatically by this package; `/workflow doctor`
-reports what is missing.
+The workflow requires four companion extensions. None are installed
+automatically by this package; `/workflow doctor` reports what is installed and
+whether the workflow is withheld.
 
 | Extension | Why the workflow needs it | Install |
 | --- | --- | --- |
 | `pi-subagents` | the oracle/worker/reviewer/scout/researcher roles | `pi install npm:pi-subagents` |
-| `context-mode` | bulky-I/O rules via `ctx_execute`/`ctx_batch_execute`/`ctx_search` | `pi install npm:context-mode` |
 | `pi-boomerang` | long autonomous runs without raw output in context | `pi install npm:pi-boomerang` |
+| `context-mode` | bulky-I/O rules via `ctx_execute`/`ctx_batch_execute`/`ctx_search` | `pi install npm:context-mode` |
+| `pi-failover` | the model roster and `failover/<name>` routing | `pi install git:github.com/rthadani/pi-failover` |
 | `ask_user` (optional) | the one-focused-question rule | `pi install npm:pi-ask-user` |
 
-`pi-subagents`, `context-mode`, and `pi-boomerang` are required: when one is
-missing, `/workflow doctor` reports it as missing and required. `ask_user` is
-optional and degrades gracefully, because the one-question-at-a-time rule can
-be followed without the tool.
+`pi-subagents`, `pi-boomerang`, `context-mode`, and `pi-failover` are required:
+when any one is not installed, the packaged workflow is withheld (not injected)
+until it is. The check is on installation (pi's settings `packages` plus the
+model registry's `failover` provider), never on runtime tool visibility, so a
+lazy extension that has not yet registered its tools does not suppress the
+workflow. The model roster is independent and still injects. `ask_user` is
+optional and never gates anything; the one-question-at-a-time rule degrades
+gracefully without the tool.
 
-The full workflow asset is always injected, regardless of which extensions
-are installed; it is never filtered or gated. A user `ORCHESTRATOR.md` is also
-injected verbatim, exactly as written.
+Your own `ORCHESTRATOR.md` is never withheld: when one is present it is
+injected verbatim, exactly as written, regardless of which extensions are
+installed.
 
 ## What it deliberately does not do
 

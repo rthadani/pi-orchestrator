@@ -8,8 +8,12 @@
  * agent dir, nearest first) replaces the packaged default outright; the two are
  * never injected together. pi loads its own context files separately, so those
  * do not suppress this workflow. The roster is always injected from failover.json.
- * The workflow asset is always injected in full, never filtered by which tools
- * are installed; /workflow doctor reports the extensions it expects.
+ * The packaged workflow is injected only when all four required companion
+ * extensions are installed; a missing one withholds it (the roster still injects).
+ * Installation is read from pi's settings packages plus the model registry's
+ * `failover` provider, not from runtime tool visibility. /workflow doctor reports
+ * what is installed and whether the workflow is withheld. A user's own
+ * ORCHESTRATOR.md is always injected verbatim, never withheld.
  *
  * Warning: a class name is not a model string. Pass `failover/<model-name>`;
  * `failover/<class>` does not resolve to that class and falls back to the
@@ -341,36 +345,66 @@ if (process.env.ORCHESTRATOR_DEBUG) {
 
 interface CapabilityDef {
   capability: string;
-  tools: string[];
+  /** Package name matched against pi's settings `packages` (installation gate). */
+  package?: string;
+  /** Provider name matched against the model registry (installation gate). */
+  provider?: string;
   install: string;
   required: boolean;
 }
 
-/** Extensions the workflow relies on; the first three are required, ask_user is optional. */
+/**
+ * Extensions the workflow relies on. The four required ones gate the packaged
+ * workflow; ask_user is optional and must never gate anything. Gates are about
+ * installation (settings packages or the model registry), never runtime tools.
+ */
 const CAPABILITY_DEFS: CapabilityDef[] = [
-  { capability: "pi-subagents", tools: ["subagent"], install: "pi install npm:pi-subagents", required: true },
-  { capability: "pi-boomerang", tools: ["boomerang"], install: "pi install npm:pi-boomerang", required: true },
+  { capability: "pi-subagents", package: "pi-subagents", install: "pi install npm:pi-subagents", required: true },
+  { capability: "pi-boomerang", package: "pi-boomerang", install: "pi install npm:pi-boomerang", required: true },
   {
     capability: "context-mode",
-    tools: ["ctx_execute", "ctx_batch_execute", "ctx_search"],
+    package: "context-mode",
     install: "pi install npm:context-mode",
     required: true,
   },
-  { capability: "ask_user", tools: ["ask_user"], install: "pi install npm:pi-ask-user", required: false },
+  {
+    capability: "pi-failover",
+    provider: "failover",
+    install: "pi install git:github.com/rthadani/pi-failover",
+    required: true,
+  },
+  { capability: "ask_user", package: "pi-ask-user", install: "pi install npm:pi-ask-user", required: false },
 ];
 
-/** Extension names whose required tools are present, per the pi tool list. */
-export function detectCapabilities(hasTool: (name: string) => boolean): Set<string> {
+/** Runtime tools each extension may expose; informational only, never a gate. */
+const INFO_TOOLS: Readonly<Record<string, readonly string[]>> = {
+  "pi-subagents": ["subagent"],
+  "pi-boomerang": ["boomerang"],
+  "context-mode": ["ctx_execute", "ctx_batch_execute", "ctx_search"],
+  "pi-failover": [],
+  ask_user: ["ask_user"],
+};
+
+/** Capabilities present per installed packages and model-registry providers. */
+export function detectExtensions(
+  hasPackage: (name: string) => boolean,
+  hasProvider: (name: string) => boolean,
+): Set<string> {
   const present = new Set<string>();
   for (const def of CAPABILITY_DEFS) {
-    if (def.tools.some((name) => hasTool(name))) present.add(def.capability);
+    const byPackage = def.package !== undefined && hasPackage(def.package);
+    const byProvider = def.provider !== undefined && hasProvider(def.provider);
+    if (byPackage || byProvider) present.add(def.capability);
   }
   return present;
 }
 
-let warnedToolDetection = false;
+/** Required capabilities missing from an available set; empty when all present. */
+export function missingRequired(available: ReadonlySet<string>): CapabilityDef[] {
+  return CAPABILITY_DEFS.filter((def) => def.required && !available.has(def.capability));
+}
 
-/** Best-effort tool names from pi; null when getAllTools is absent or throws. */
+/** Best-effort tool names from pi; null when getAllTools is absent or throws. Informational only. */
 function collectToolNames(pi: ExtensionAPI): ReadonlySet<string> | null {
   try {
     const getAll = (pi as unknown as { getAllTools?: () => unknown }).getAllTools;
@@ -388,25 +422,113 @@ function collectToolNames(pi: ExtensionAPI): ReadonlySet<string> | null {
   }
 }
 
-/** Tool names plus a single load-time warning when detection is impossible. */
-function detectTools(pi: ExtensionAPI): ReadonlySet<string> | null {
-  const names = collectToolNames(pi);
-  if (names === null && !warnedToolDetection) {
-    warnedToolDetection = true;
-    console.warn(
-      "[pi-orchestrator] tool detection unavailable; /workflow doctor cannot audit extensions",
-    );
+/** pi's settings.json path, honouring PI_CODING_AGENT_DIR when set. */
+function settingsPath(): string {
+  const agentDirPath = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  return join(agentDirPath, "settings.json");
+}
+
+/**
+ * Installed package sources from settings.json, or null when unreadable or
+ * unparseable. Entries may be strings or objects with a `source` string.
+ */
+function readInstalledPackages(path: string): ReadonlySet<string> | null {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null;
   }
-  return names;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const packages = (parsed as { packages?: unknown } | null | undefined)?.packages;
+  if (!Array.isArray(packages)) return null;
+  const sources = new Set<string>();
+  for (const entry of packages) {
+    if (typeof entry === "string") sources.add(entry);
+    else if (entry && typeof entry === "object") {
+      const source = (entry as { source?: unknown }).source;
+      if (typeof source === "string") sources.add(source);
+    }
+  }
+  return sources;
+}
+
+/** Predicate: is a package name present in any installed source (case-insensitive)? */
+function hasInstalledPackage(installed: ReadonlySet<string>): (name: string) => boolean {
+  const lower = Array.from(installed, (source) => source.toLowerCase());
+  return (name: string) => {
+    const needle = name.toLowerCase();
+    return lower.some((source) => source.includes(needle));
+  };
+}
+
+/** Best-effort provider names from the model registry; null when unavailable or throws. */
+function collectProviderNames(ctx: unknown): ReadonlySet<string> | null {
+  try {
+    const registry = (ctx as { modelRegistry?: { getProvider?: (name: string) => unknown } } | undefined)
+      ?.modelRegistry;
+    if (!registry || typeof registry.getProvider !== "function") return null;
+    const names = new Set<string>();
+    for (const def of CAPABILITY_DEFS) {
+      if (def.provider && registry.getProvider(def.provider)) names.add(def.provider);
+    }
+    return names;
+  } catch {
+    return null;
+  }
+}
+
+/** Present capabilities, or null when settings or the model registry cannot be probed. */
+export function detectPresent(ctx: unknown): ReadonlySet<string> | null {
+  const installed = readInstalledPackages(settingsPath());
+  const providerNames = collectProviderNames(ctx);
+  if (installed === null || providerNames === null) return null;
+  return detectExtensions(hasInstalledPackage(installed), (name) => providerNames.has(name));
+}
+
+const warnedMissingKeys = new Set<string>();
+
+/** Warn once per missing set that the packaged workflow is withheld. */
+function warnMissingRequired(missing: readonly CapabilityDef[]): void {
+  const key = missing
+    .map((def) => def.capability)
+    .sort()
+    .join(",");
+  if (warnedMissingKeys.has(key)) return;
+  warnedMissingKeys.add(key);
+  const list = missing.map((def) => `${def.capability} (run \`${def.install}\`)`).join(", ");
+  console.warn(
+    `[pi-orchestrator] missing required extensions: ${list}. The packaged workflow is withheld until they are installed.`,
+  );
+}
+
+let warnedEnforcementUnverified = false;
+
+/** Warn once when enforcement could not be verified; the workflow fails open. */
+function warnEnforcementUnverified(): void {
+  if (warnedEnforcementUnverified) return;
+  warnedEnforcementUnverified = true;
+  console.warn(
+    "[pi-orchestrator] required-extension enforcement could not be verified (settings.json or modelRegistry unavailable); injecting the workflow anyway.",
+  );
 }
 
 export interface DoctorState {
-  /** Extension names detected as present, from detectCapabilities. */
+  /** Extension names detected as installed, from detectExtensions. */
   available: ReadonlySet<string>;
   workflowSource: "user" | "default";
   workflowPath: string;
   failoverFound: boolean;
   failoverPath: string;
+  /** Whether the packaged workflow is currently withheld for missing extensions. */
+  withheld: boolean;
+  /** Runtime tool names seen via pi.getAllTools(); informational, never a gate. */
+  toolsSeen: ReadonlySet<string> | null;
 }
 
 /** Render the /workflow doctor report; pure so it can be exercised offline. */
@@ -446,33 +568,48 @@ export function renderDoctorReport(state: DoctorState): string {
   lines.push("");
   if (state.workflowSource === "user") {
     lines.push(
-      `workflow override: user ORCHESTRATOR.md (${state.workflowPath}); injected verbatim, never filtered`,
+      `workflow override: user ORCHESTRATOR.md (${state.workflowPath}); injected verbatim, never withheld`,
     );
+  } else if (state.withheld) {
+    lines.push("workflow status: WITHHELD — required extensions are missing; the roster still injects");
   } else {
-    lines.push("workflow override: none (packaged default, injected in full)");
+    lines.push("workflow status: injecting (packaged default; all required extensions installed)");
+  }
+  lines.push("");
+  const toolsSeen = state.toolsSeen;
+  if (toolsSeen !== null) {
+    lines.push("runtime tools (informational, not a gate):");
+    for (const def of CAPABILITY_DEFS) {
+      const tools = INFO_TOOLS[def.capability] ?? [];
+      if (tools.length === 0) continue;
+      const seen = tools.map((name) => `${name}=${toolsSeen.has(name) ? "seen" : "not seen"}`).join(", ");
+      lines.push(`- ${def.capability}: ${seen}`);
+    }
+  } else {
+    lines.push("runtime tools: unavailable (informational, not a gate)");
   }
   lines.push("");
   if (state.failoverFound) {
     lines.push(`failover config: found (${state.failoverPath})`);
   } else {
-    lines.push(
-      `failover config: not found — install a model provider with \`pi install git:github.com/rthadani/pi-failover\``,
-    );
+    lines.push(`failover config: not found (${state.failoverPath})`);
   }
   return lines.join("\n");
 }
 
 export default function piRoster(pi: ExtensionAPI): void {
-  // Probe once at load so a pi without getAllTools warns immediately instead of
-  // silently skipping the doctor audit.
-  detectTools(pi);
-
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
     const rosterState = loadRoster();
     const workflowState = loadWorkflow();
-    // The workflow (user file or packaged default) is always injected in full,
-    // never filtered by which tools are installed.
-    const sections = renderDefaultSections(workflowState.section, rosterState);
+
+    const present = detectPresent(ctx);
+    const missing = present === null ? null : missingRequired(present);
+    // Fail open when detection is unavailable; a user's own file is never withheld.
+    const withhold = missing !== null && missing.length > 0 && workflowState.source !== "user";
+    const sections = renderDefaultSections(
+      workflowState.section && !withhold ? workflowState.section : "",
+      rosterState,
+    );
 
     if (sections.workflow) {
       event.systemPromptOptions.sections.orchestrator_workflow = sections.workflow;
@@ -483,6 +620,12 @@ export default function piRoster(pi: ExtensionAPI): void {
       event.systemPromptOptions.sections.model_roster = sections.roster;
     } else {
       delete event.systemPromptOptions.sections.model_roster;
+    }
+
+    if (missing === null) {
+      warnEnforcementUnverified();
+    } else if (withhold) {
+      warnMissingRequired(missing);
     }
   });
 
@@ -498,21 +641,27 @@ export default function piRoster(pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       if (tokens[0] === "doctor") {
-        const tools = detectTools(pi);
-        if (tools === null) {
-          ctx.ui.notify("tool detection unavailable; cannot audit workflow extensions", "error");
+        const present = detectPresent(ctx);
+        if (present === null) {
+          ctx.ui.notify(
+            "extension detection unavailable (settings.json or modelRegistry); cannot audit workflow extensions",
+            "error",
+          );
           return;
         }
-        const available = detectCapabilities((name) => tools.has(name));
         const workflow = loadWorkflow();
         const roster = loadRoster();
+        const missing = missingRequired(present);
+        const withheld = missing.length > 0 && workflow.source !== "user";
         ctx.ui.notify(
           renderDoctorReport({
-            available,
+            available: present,
             workflowSource: workflow.source,
             workflowPath: workflow.path,
             failoverFound: roster.disabled !== "config file missing",
             failoverPath: roster.path,
+            withheld,
+            toolsSeen: collectToolNames(pi),
           }),
           "info",
         );
