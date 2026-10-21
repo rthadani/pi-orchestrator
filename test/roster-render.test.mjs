@@ -2,7 +2,7 @@
 // (mtime-cached config loading) in extensions/pi-roster.ts with offline
 // fixtures. No framework; throws on failure; prints PASS lines.
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,7 +44,7 @@ function inOrder(line, names) {
 // FAILOVER_CONFIG from the environment.
 delete process.env.FAILOVER_CONFIG;
 
-const { renderRoster, loadRoster, default: piRoster } = await import("../extensions/pi-roster.ts");
+const { renderRoster, loadRoster, findContextFiles, renderDefaultSections, loadWorkflow, default: piRoster } = await import("../extensions/pi-roster.ts");
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -264,6 +264,119 @@ runCase("CASE 14: sonnet's xhigh model shows :xhigh->max", () => {
   const text = renderRoster(fixture);
   const sonnet = classLine(text, "sonnet");
   assert(/:xhigh->max/.test(sonnet), `missing :xhigh->max in sonnet line: ${sonnet}`);
+});
+
+const FIVE = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+const sampleRoster = { section: "roster section", path: "", mtimeMs: null, disabled: null };
+
+runCase("CASE 15: context detection matrix across the five filenames and dirs", () => {
+  const wf = "packaged workflow";
+  const none = findContextFiles("/proj/sub", "/agents", () => false);
+  assert(none.length === 0, `expected no context files, got ${none.length}`);
+  assert(
+    renderDefaultSections(wf, sampleRoster, none.length > 0).workflow === wf,
+    "no hits should inject the workflow",
+  );
+
+  for (const filename of FIVE) {
+    for (const dir of ["/proj/sub", "/proj", "/agents"]) {
+      const hit = join(dir, filename);
+      const set = new Set([hit]);
+      const found = findContextFiles("/proj/sub", "/agents", (p) => set.has(p));
+      assert(found.length === 1, `expected one hit for ${filename} in ${dir}, got ${found.length}`);
+      assert(found[0] === hit, `wrong path for ${filename} in ${dir}: ${found[0]}`);
+      const sections = renderDefaultSections(wf, sampleRoster, found.length > 0);
+      assert(sections.workflow === null, `workflow should be suppressed by ${hit}`);
+      assert(sections.roster === "roster section", `roster must stay injected alongside ${hit}`);
+    }
+  }
+});
+
+runCase("CASE 16: absent context injects both; present context injects roster only", () => {
+  const wf = "workflow";
+  const absent = renderDefaultSections(wf, sampleRoster, false);
+  assert(absent.workflow === wf, "absent context should inject the workflow");
+  assert(absent.roster === "roster section", "absent context should inject the roster");
+  const present = renderDefaultSections(wf, sampleRoster, true);
+  assert(present.workflow === null, "present context should leave no workflow key");
+  assert(present.roster === "roster section", "present context should still inject the roster");
+});
+
+runCase("CASE 17: malformed failover leaves roster out but workflow in", () => {
+  const bad = join(tmp, "bad2.json");
+  writeFileSync(bad, "{ not json");
+  process.env.FAILOVER_CONFIG = bad;
+  const roster = loadRoster();
+  assert(roster.section === "", "malformed config should yield an empty roster");
+  assert(roster.disabled, "malformed config should carry a disabled reason");
+  const sections = renderDefaultSections("workflow", roster, false);
+  assert(sections.roster === null, "disabled roster should be omitted");
+  assert(sections.workflow === "workflow", "workflow must be independent of roster failure");
+});
+
+runCase("CASE 18: missing workflow asset yields no section and no throw", () => {
+  const missingDir = mkdtempSync(join(tmpdir(), "pi-roster-missing-"));
+  const copied = join(missingDir, "pi-roster.ts");
+  copyFileSync(join(here, "..", "extensions", "pi-roster.ts"), copied);
+  const script = [
+    `const mod = await import(${JSON.stringify(copied)});`,
+    `const s = mod.loadWorkflow();`,
+    `if (s.section !== "") throw new Error("expected empty workflow section, got " + JSON.stringify(s.section));`,
+    `if (!s.disabled) throw new Error("expected a disabled reason");`,
+    `console.log("MISSING-OK");`,
+  ].join("\n");
+  const res = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: missingDir,
+    encoding: "utf8",
+  });
+  assert(res.status === 0, `missing-asset subprocess failed:\n${res.stderr}`);
+  assert((res.stdout || "").includes("MISSING-OK"), `missing-asset subprocess did not confirm:\n${res.stdout}`);
+  const warns = (res.stderr || "").split("\n").filter((l) => l.includes("[pi-roster] workflow disabled"));
+  assert(warns.length === 1, `expected one workflow-disabled warn, got ${warns.length}:\n${res.stderr}`);
+  rmSync(missingDir, { recursive: true, force: true });
+});
+
+runCase("CASE 19: shipped workflow asset names no models or providers", () => {
+  const asset = join(here, "..", "assets", "workflow.md");
+  const text = readFileSync(asset, "utf8");
+  assert(
+    !/kimi|deepseek|glm|minimax|moonshot|anthropic|openai|failover\//i.test(text),
+    "workflow asset leaks a model or provider name",
+  );
+});
+
+runCase("CASE 20: injected workflow is non-empty when present", () => {
+  const state = loadWorkflow();
+  assert(state.section.length > 0, "shipped workflow asset should be non-empty");
+  const sections = renderDefaultSections(state.section, sampleRoster, false);
+  assert(
+    typeof sections.workflow === "string" && sections.workflow.length > 0,
+    "workflow section should be non-empty when injected",
+  );
+});
+
+runCase("CASE 21: /workflow command reports the workflow source and roster", () => {
+  let handler;
+  let notifyText = "";
+  const pi = {
+    on() {},
+    registerCommand(name, opts) {
+      if (name === "workflow") handler = opts.handler;
+    },
+  };
+  piRoster(pi);
+  assert(handler, "registerCommand('workflow') was not called");
+  const ctx = { ui: { notify(text) { notifyText = text; } } };
+  handler("", ctx);
+  assert(typeof notifyText === "string" && notifyText.length > 0, "workflow handler did not notify");
+  assert(
+    /workflow source|workflow disabled/.test(notifyText),
+    `unexpected workflow report:\n${notifyText}`,
+  );
+  assert(
+    /## Model roster|roster disabled/.test(notifyText),
+    `workflow report missing roster:\n${notifyText}`,
+  );
 });
 
 rmSync(tmp, { recursive: true, force: true });

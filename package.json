@@ -8,7 +8,7 @@
   "author": "Rohit Thadani <rohit.thadani@gmail.com>",
   "repository": { "type": "git", "url": "git+ssh://git@github.com/rthadani/pi-roster.git" },
   "bugs": { "url": "https://github.com/rthadani/pi-roster/issues" },
-  "files": ["extensions", "README.md"],
+  "files": ["extensions", "assets", "README.md"],
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
   "pi": { "extensions": ["./extensions/pi-roster.ts"] }
 }

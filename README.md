@@ -38,9 +38,21 @@ The roster is rendered once and cached. It is re-read only when the config file'
 
 The `/roster` command prints exactly what would be injected, plus the config path and mtime. Set `ROSTER_DEBUG=1` to log the same report at load.
 
+## Default workflow
+
+The package ships a condensed default orchestration workflow (`assets/workflow.md`). It is injected into the system prompt only when you have no context file of your own. Any of these files, in the current working directory, any parent directory, or the agent dir, wins and replaces the default:
+
+`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`
+
+The model roster is independent: it always comes from `failover.json`, whether or not a default workflow is injected.
+
+To disable the shipped default while keeping the roster, create an empty `AGENTS.md`.
+
+The shipped asset is not meant to be edited in place: package updates overwrite it. To change the workflow, put your own context file in the project (or the agent dir) instead.
+
 ## What it deliberately does not do
 
-It makes no routing decisions, contains no role or policy text, and never contacts a provider. Policy (which class to pick when, escalation rules, review discipline) belongs in the workflow file and is never rendered here.
+It makes no routing decisions and never contacts a provider. The roster section itself contains no role or policy text; policy (which class to pick when, escalation rules, review discipline) lives in your context file, or in the packaged default workflow when you have none.
 
 ## Tests
 
