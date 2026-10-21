@@ -1,14 +1,14 @@
 {
-  "name": "@rthadani/pi-roster",
+  "name": "@rthadani/pi-orchestrator",
   "version": "1.0.0",
   "private": false,
   "description": "A pi extension that renders the models in your failover.json into a compact system-prompt section, so AGENTS.md can name capability classes instead of hardcoding model names.",
   "keywords": ["pi-package", "pi", "failover", "models", "roster", "prompt"],
   "license": "MIT",
   "author": "Rohit Thadani <rohit.thadani@gmail.com>",
-  "repository": { "type": "git", "url": "git+ssh://git@github.com/rthadani/pi-roster.git" },
-  "bugs": { "url": "https://github.com/rthadani/pi-roster/issues" },
+  "repository": { "type": "git", "url": "git+ssh://git@github.com/rthadani/pi-orchestrator.git" },
+  "bugs": { "url": "https://github.com/rthadani/pi-orchestrator/issues" },
   "files": ["extensions", "assets", "README.md"],
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
-  "pi": { "extensions": ["./extensions/pi-roster.ts"] }
+  "pi": { "extensions": ["./extensions/pi-orchestrator.ts"] }
 }

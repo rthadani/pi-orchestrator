@@ -1,5 +1,5 @@
 /**
- * pi-roster: inject the failover.json model catalog and, when the user has no
+ * pi-orchestrator: inject the failover.json model catalog and, when the user has no
  * context file, a condensed default workflow into the system prompt.
  *
  * AGENTS.md names capability classes (opus, sonnet, flash, coding) rather
@@ -321,17 +321,17 @@ function workflowReport(): string {
 // immediately, exactly once.
 const initialState = loadRoster();
 if (initialState.disabled) {
-  console.warn(`[pi-roster] roster disabled: ${initialState.disabled}`);
+  console.warn(`[pi-orchestrator] roster disabled: ${initialState.disabled}`);
 }
 const initialWorkflow = loadWorkflow();
 if (initialWorkflow.disabled) {
-  console.warn(`[pi-roster] workflow disabled: ${initialWorkflow.disabled}`);
+  console.warn(`[pi-orchestrator] workflow disabled: ${initialWorkflow.disabled}`);
 }
 if (process.env.ROSTER_DEBUG) {
-  console.log(`[pi-roster]\n${rosterReport(initialState)}`);
+  console.log(`[pi-orchestrator]\n${rosterReport(initialState)}`);
 }
 if (process.env.ORCHESTRATOR_DEBUG) {
-  console.log(`[pi-roster]\n${workflowReport()}`);
+  console.log(`[pi-orchestrator]\n${workflowReport()}`);
 }
 
 export default function piRoster(pi: ExtensionAPI): void {

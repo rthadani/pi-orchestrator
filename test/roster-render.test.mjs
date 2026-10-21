@@ -1,5 +1,5 @@
-// pi-roster render harness: exercises renderRoster (pure) and loadRoster
-// (mtime-cached config loading) in extensions/pi-roster.ts with offline
+// pi-orchestrator render harness: exercises renderRoster (pure) and loadRoster
+// (mtime-cached config loading) in extensions/pi-orchestrator.ts with offline
 // fixtures. No framework; throws on failure; prints PASS lines.
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
@@ -44,7 +44,7 @@ function inOrder(line, names) {
 // FAILOVER_CONFIG from the environment.
 delete process.env.FAILOVER_CONFIG;
 
-const { renderRoster, loadRoster, findContextFiles, renderDefaultSections, loadWorkflow, default: piRoster } = await import("../extensions/pi-roster.ts");
+const { renderRoster, loadRoster, findContextFiles, renderDefaultSections, loadWorkflow, default: piRoster } = await import("../extensions/pi-orchestrator.ts");
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -215,15 +215,15 @@ runCase("CASE 9: mtime change reloads the config", () => {
 runCase("CASE 10: malformed config warns exactly once at load", () => {
   const bad = join(tmp, "warn.json");
   writeFileSync(bad, "{ not json");
-  const extPath = join(here, "..", "extensions", "pi-roster.ts");
+  const extPath = join(here, "..", "extensions", "pi-orchestrator.ts");
   const script = `import(${JSON.stringify(extPath)}).catch(() => process.exit(1));`;
   const res = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     cwd: here,
     env: { ...process.env, FAILOVER_CONFIG: bad },
     encoding: "utf8",
   });
-  const warns = (res.stderr || "").split("\n").filter((l) => l.includes("[pi-roster]"));
-  assert(warns.length === 1, `expected one [pi-roster] warn, got ${warns.length}:\n${res.stderr}`);
+  const warns = (res.stderr || "").split("\n").filter((l) => l.includes("[pi-orchestrator]"));
+  assert(warns.length === 1, `expected one [pi-orchestrator] warn, got ${warns.length}:\n${res.stderr}`);
 });
 
 runCase("CASE 11: /roster command reports the roster or a disabled reason", () => {
@@ -316,8 +316,8 @@ runCase("CASE 17: malformed failover leaves roster out but workflow in", () => {
 
 runCase("CASE 18: missing workflow asset yields no section and no throw", () => {
   const missingDir = mkdtempSync(join(tmpdir(), "pi-roster-missing-"));
-  const copied = join(missingDir, "pi-roster.ts");
-  copyFileSync(join(here, "..", "extensions", "pi-roster.ts"), copied);
+  const copied = join(missingDir, "pi-orchestrator.ts");
+  copyFileSync(join(here, "..", "extensions", "pi-orchestrator.ts"), copied);
   const script = [
     `const mod = await import(${JSON.stringify(copied)});`,
     `const s = mod.loadWorkflow();`,
@@ -331,7 +331,7 @@ runCase("CASE 18: missing workflow asset yields no section and no throw", () => 
   });
   assert(res.status === 0, `missing-asset subprocess failed:\n${res.stderr}`);
   assert((res.stdout || "").includes("MISSING-OK"), `missing-asset subprocess did not confirm:\n${res.stdout}`);
-  const warns = (res.stderr || "").split("\n").filter((l) => l.includes("[pi-roster] workflow disabled"));
+  const warns = (res.stderr || "").split("\n").filter((l) => l.includes("[pi-orchestrator] workflow disabled"));
   assert(warns.length === 1, `expected one workflow-disabled warn, got ${warns.length}:\n${res.stderr}`);
   rmSync(missingDir, { recursive: true, force: true });
 });

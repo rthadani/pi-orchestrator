@@ -1,4 +1,4 @@
-# pi-roster
+# pi-orchestrator
 
 A pi extension that renders the models in your `failover.json` into a compact system-prompt section, so your workflow file can name capability classes instead of hardcoding model names.
 
@@ -25,7 +25,7 @@ A workflow file like `AGENTS.md` should name capability classes (`opus`, `sonnet
 ## Install
 
 ```
-pi install git:github.com/rthadani/pi-roster
+pi install git:github.com/rthadani/pi-orchestrator
 ```
 
 ## Config
