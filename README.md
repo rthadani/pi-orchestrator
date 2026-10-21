@@ -1,10 +1,24 @@
 # pi-orchestrator
 
-A pi extension that renders the models in your `failover.json` into a compact system-prompt section, so your workflow file can name capability classes instead of hardcoding model names.
+A pi extension that ships a default agent workflow and injects it into the
+system prompt, so installing the package gives you a working
+plan -> implement -> review loop without writing an AGENTS.md. It also renders
+your `failover.json` into a model roster, so the workflow can name capability
+classes instead of hardcoding model names.
 
 ## What it does
 
-At startup it reads your failover config and renders one line per capability class, listing that class's models in failover order with input/output cost and modality. The result is appended to the system prompt as a "Model roster" section:
+Two sections are injected, and neither ever names a specific model.
+
+**Workflow.** The packaged default in `assets/ORCHESTRATOR.example.md` is
+injected unless you provide your own `ORCHESTRATOR.md` in the current
+directory, a parent, or the pi agent dir. Yours replaces the default outright.
+Blocks that need tools from other packages are gated on those tools being
+installed, so a bare install is never told to call a tool that does not exist.
+
+**Model roster.** Read from your failover config and rendered one line per
+capability class, listing each class's models in failover order with
+input/output cost and modality:
 
 ```
 ## Model roster (from failover.json)
@@ -16,7 +30,9 @@ backends without image support.
 - fast: fast-model ($0.14/$0.28, text) -> second-fast ($0.15/$0.5, text+image)
 ```
 
-Each model is shown as `name ($in/$out, modality)`. A model that appears in more than one class is listed with full details the first time and as a bare name after, and a model whose `thinkingLevelMap` maps `xhigh` carries a `:xhigh->max` marker.
+Each model is shown as `name ($in/$out, modality)`. A model appearing in more
+than one class carries full details the first time and a bare name after, and
+a model whose `thinkingLevelMap` maps `xhigh` gets a `:xhigh->max` marker.
 
 ## Why it exists
 
@@ -37,6 +53,11 @@ It honours `FAILOVER_CONFIG`, defaulting to `~/.pi/agent/failover.json`, the sam
 The roster is rendered once and cached. It is re-read only when the config file's mtime changes (or the resolved path changes). If the config is missing, unreadable, or malformed, the extension injects nothing and warns once at load; it never throws into a session.
 
 The `/roster` command prints exactly what would be injected, plus the config path and mtime. Set `ROSTER_DEBUG=1` to log the same report at load.
+
+`/workflow` reports which workflow source won (your `ORCHESTRATOR.md` with its
+path, or the packaged default with its mtime); `/workflow init` copies the
+template to a file you own; `/workflow doctor` audits which capabilities are
+installed. Set `ORCHESTRATOR_DEBUG=1` to log the workflow report at load.
 
 ## Default workflow
 
