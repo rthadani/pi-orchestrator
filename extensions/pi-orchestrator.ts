@@ -1,14 +1,13 @@
 /**
- * pi-orchestrator: inject the failover.json model catalog and, when the user has no
- * context file, a condensed default workflow into the system prompt.
+ * pi-orchestrator: inject the failover.json model catalog and, when the user has
+ * no ORCHESTRATOR.md, a condensed default workflow into the system prompt.
  *
- * AGENTS.md names capability classes (opus, sonnet, flash, coding) rather
- * than models; the roster section lists which models each class contains.
- * The shipped workflow asset (assets/workflow.md) is injected only when the
- * user owns no context file in cwd, a parent directory, or the agent dir. A
- * user's own AGENTS.md (or AGENTS.override.md / CLAUDE.md variant) wins and
- * suppresses the default workflow; the roster is always injected from
- * failover.json.
+ * The workflow file names capability classes (opus, sonnet, flash, coding)
+ * rather than models; the roster section lists which models each class contains.
+ * A user's own ORCHESTRATOR.md (found in cwd, any parent directory, or the
+ * agent dir, nearest first) replaces the packaged default outright; the two are
+ * never injected together. pi loads its own context files separately, so those
+ * do not suppress this workflow. The roster is always injected from failover.json.
  *
  * Warning: a class name is not a model string. Pass `failover/<model-name>`;
  * `failover/<class>` does not resolve to that class and falls back to the
@@ -16,7 +15,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -173,30 +172,12 @@ function rosterReport(state: RosterState): string {
   return state.section ? `${state.section}\n${meta}` : `roster disabled: ${state.disabled}\n${meta}`;
 }
 
-/** Context file names pi discovers, in its own priority order. */
-export const CONTEXT_FILENAMES = [
-  "AGENTS.override.md",
-  "AGENTS.md",
-  "AGENTS.MD",
-  "CLAUDE.md",
-  "CLAUDE.MD",
-] as const;
-
 function agentDir(): string {
   return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 }
 
-/**
- * Find every context file pi would load for this working directory: the five
- * candidate names in cwd, each parent up to the filesystem root, then the agent
- * dir. Any hit means the user owns the instructions and the packaged default
- * workflow must be suppressed.
- */
-export function findContextFiles(
-  cwd: string,
-  agentDir: string,
-  exists: (p: string) => boolean,
-): string[] {
+/** Directories searched for ORCHESTRATOR.md: cwd up to the root, then the agent dir. */
+function candidateDirs(cwd: string, agentDir: string): string[] {
   const dirs: string[] = [];
   const seen = new Set<string>();
   const addDir = (dir: string): void => {
@@ -214,62 +195,84 @@ export function findContextFiles(
     current = parent;
   }
   addDir(agentDir);
+  return dirs;
+}
 
-  const found: string[] = [];
-  for (const dir of dirs) {
-    for (const filename of CONTEXT_FILENAMES) {
-      const path = join(dir, filename);
-      if (exists(path)) found.push(path);
-    }
+/**
+ * Find the nearest ORCHESTRATOR.md: cwd, then each parent up to the filesystem
+ * root, then the agent dir as the global fallback. Pure: takes an `exists`
+ * predicate so the search order is testable without touching the filesystem.
+ */
+export function findOrchestratorFile(
+  cwd: string,
+  agentDir: string,
+  exists: (p: string) => boolean,
+): string | undefined {
+  for (const dir of candidateDirs(cwd, agentDir)) {
+    const path = join(dir, "ORCHESTRATOR.md");
+    if (exists(path)) return path;
   }
-  return found;
+  return undefined;
 }
 
 export interface WorkflowState {
-  /** The packaged workflow section, or "" when the asset could not be read. */
+  /** The workflow section to inject, or "" when no workflow was loaded. */
   section: string;
-  /** The resolved asset path. */
+  /** The resolved file path (user file or packaged asset). */
   path: string;
-  /** File mtime in ms, or null when the asset is missing. */
+  /** File mtime in ms, or null when the file is missing. */
   mtimeMs: number | null;
   /** Why the workflow is disabled, or null when a section was loaded. */
   disabled: string | null;
+  /** Which source won: the user's ORCHESTRATOR.md or the packaged default. */
+  source: "user" | "default";
 }
 
 function workflowAssetPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "..", "assets", "workflow.md");
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "assets", "ORCHESTRATOR.example.md");
 }
 
-function buildWorkflow(path: string, mtimeMs: number | null): WorkflowState {
+function buildWorkflow(path: string, source: "user" | "default"): WorkflowState {
+  const mtimeMs = mtimeOf(path);
   if (mtimeMs === null) {
-    return { section: "", path, mtimeMs: null, disabled: "workflow asset missing" };
+    return {
+      section: "",
+      path,
+      mtimeMs: null,
+      disabled: source === "default" ? "workflow asset missing" : "workflow file missing",
+      source,
+    };
   }
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
   } catch (error) {
-    return { section: "", path, mtimeMs, disabled: `unreadable: ${describeError(error)}` };
+    return { section: "", path, mtimeMs, disabled: `unreadable: ${describeError(error)}`, source };
   }
   if (raw.trim() === "") {
-    return { section: "", path, mtimeMs, disabled: "workflow asset empty" };
+    return { section: "", path, mtimeMs, disabled: "workflow file empty", source };
   }
-  return { section: raw, path, mtimeMs, disabled: null };
+  return { section: raw, path, mtimeMs, disabled: null, source };
 }
 
 let workflowCache: WorkflowState | null = null;
 
 /**
- * Read the packaged workflow asset, caching it and only re-reading when the
- * asset's mtime changes. Never throws; a missing or unreadable asset yields an
- * empty section with a `disabled` reason.
+ * Resolve the winning workflow: the user's ORCHESTRATOR.md when one exists,
+ * otherwise the packaged default. Cached by resolved path + mtime, so user and
+ * default files are only re-read when they change. Never throws; a missing or
+ * unreadable file yields an empty section with a `disabled` reason.
  */
-export function loadWorkflow(): WorkflowState {
-  const path = workflowAssetPath();
-  const mtimeMs = mtimeOf(path);
-  if (workflowCache && workflowCache.path === path && workflowCache.mtimeMs === mtimeMs) {
+export function loadWorkflow(cwd?: string, agentDirPath?: string): WorkflowState {
+  const resolvedCwd = cwd ?? process.cwd();
+  const resolvedAgentDir = agentDirPath ?? agentDir();
+  const userPath = findOrchestratorFile(resolvedCwd, resolvedAgentDir, existsSync);
+  const path = userPath ?? workflowAssetPath();
+  const source: "user" | "default" = userPath ? "user" : "default";
+  if (workflowCache && workflowCache.path === path && workflowCache.mtimeMs === mtimeOf(path)) {
     return workflowCache;
   }
-  workflowCache = buildWorkflow(path, mtimeMs);
+  workflowCache = buildWorkflow(path, source);
   return workflowCache;
 }
 
@@ -281,16 +284,16 @@ export interface DefaultSections {
 }
 
 /**
- * Decide which sections to inject. Pure, no fs: the workflow is omitted when
- * the user owns a context file; the roster is omitted only when disabled.
+ * Decide which sections to inject. Pure, no fs: the workflow text (user file or
+ * packaged default, already resolved by loadWorkflow) is injected when
+ * non-empty; the roster is omitted only when disabled.
  */
 export function renderDefaultSections(
   workflowText: string,
   rosterState: RosterState,
-  hasUserContext: boolean,
 ): DefaultSections {
   return {
-    workflow: hasUserContext ? null : workflowText || null,
+    workflow: workflowText || null,
     roster: rosterState.section || null,
   };
 }
@@ -298,12 +301,12 @@ export function renderDefaultSections(
 function workflowReport(): string {
   const workflow = loadWorkflow();
   const roster = loadRoster();
-  const contextFiles = findContextFiles(process.cwd(), agentDir(), existsSync);
 
   const lines: string[] = [];
-  if (contextFiles.length > 0) {
-    lines.push("workflow source: user context files");
-    for (const path of contextFiles) lines.push(`- ${path}`);
+  if (workflow.source === "user") {
+    lines.push("workflow source: user file");
+    lines.push(`path: ${workflow.path}`);
+    if (workflow.disabled) lines.push(`note: ${workflow.disabled}`);
   } else if (workflow.section) {
     lines.push("workflow source: packaged default");
     lines.push(`asset: ${workflow.path}`);
@@ -338,8 +341,7 @@ export default function piRoster(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event) => {
     const rosterState = loadRoster();
     const workflowState = loadWorkflow();
-    const hasUserContext = findContextFiles(process.cwd(), agentDir(), existsSync).length > 0;
-    const sections = renderDefaultSections(workflowState.section, rosterState, hasUserContext);
+    const sections = renderDefaultSections(workflowState.section, rosterState);
 
     if (sections.workflow) {
       event.systemPromptOptions.sections.orchestrator_workflow = sections.workflow;
@@ -361,8 +363,31 @@ export default function piRoster(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("workflow", {
-    description: "Show which workflow source won and the model roster",
-    handler: async (_args, ctx) => {
+    description: "Show which workflow source won and the model roster; `init` copies the template",
+    handler: async (args, ctx) => {
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      if (tokens[0] === "init") {
+        const target = tokens[1]
+          ? resolve(ctx.cwd, tokens.slice(1).join(" "))
+          : resolve(ctx.cwd, "ORCHESTRATOR.md");
+        if (existsSync(target)) {
+          ctx.ui.notify(
+            `refusing to overwrite existing file: ${target}\nEdit it directly, or run /workflow init with another path.`,
+            "error",
+          );
+          return;
+        }
+        try {
+          writeFileSync(target, readFileSync(workflowAssetPath(), "utf8"), { flag: "wx" });
+          ctx.ui.notify(
+            `wrote ${target}\nNext: edit it to suit your workflow, then restart or reload pi.`,
+            "info",
+          );
+        } catch (error) {
+          ctx.ui.notify(`failed to write ${target}: ${describeError(error)}`, "error");
+        }
+        return;
+      }
       ctx.ui.notify(workflowReport(), "info");
     },
   });

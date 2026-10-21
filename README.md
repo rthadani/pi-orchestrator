@@ -20,7 +20,7 @@ Each model is shown as `name ($in/$out, modality)`. A model that appears in more
 
 ## Why it exists
 
-A workflow file like `AGENTS.md` should name capability classes (`opus`, `sonnet`, `flash`, `coding` are conventional names, not required ones) rather than model names. That way swapping a model in `failover.json` never requires editing the workflow file: the next run picks up the new catalog automatically, and the injected section always describes what each class currently resolves to.
+A workflow file like `ORCHESTRATOR.md` should name capability classes (`opus`, `sonnet`, `flash`, `coding` are conventional names, not required ones) rather than model names. That way swapping a model in `failover.json` never requires editing the workflow file: the next run picks up the new catalog automatically, and the injected section always describes what each class currently resolves to.
 
 ## Install
 
@@ -40,19 +40,33 @@ The `/roster` command prints exactly what would be injected, plus the config pat
 
 ## Default workflow
 
-The package ships a condensed default orchestration workflow (`assets/workflow.md`). It is injected into the system prompt only when you have no context file of your own. Any of these files, in the current working directory, any parent directory, or the agent dir, wins and replaces the default:
+The package ships a condensed default orchestration workflow (`assets/ORCHESTRATOR.example.md`). It is injected into the system prompt only when no `ORCHESTRATOR.md` is found. When you create one, it replaces the default outright: the default and your file are never both injected, so they cannot contradict each other.
 
-`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`
+Search order, nearest wins:
 
-The model roster is independent: it always comes from `failover.json`, whether or not a default workflow is injected.
+1. `ORCHESTRATOR.md` in the current working directory
+2. `ORCHESTRATOR.md` in any parent directory, up to the filesystem root
+3. `ORCHESTRATOR.md` in the agent dir (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`), the global fallback
 
-To disable the shipped default while keeping the roster, create an empty `AGENTS.md`.
+The model roster is independent: it always comes from `failover.json`, whether or not a workflow file is injected.
 
-The shipped asset is not meant to be edited in place: package updates overwrite it. To change the workflow, put your own context file in the project (or the agent dir) instead.
+`pi` still loads `AGENTS.md` (and the other context files) itself, so `AGENTS.md` is not a substitute for `ORCHESTRATOR.md` and does not suppress the default workflow.
+
+To start customizing, run:
+
+```
+/workflow init
+```
+
+That copies the packaged example to `./ORCHESTRATOR.md` (or to a path you pass, e.g. `/workflow init /some/where/ORCHESTRATOR.md`). It refuses to overwrite an existing file. Edit the file, then restart or reload pi.
+
+A shipped-default-only setup needs nothing: with no `ORCHESTRATOR.md` anywhere, the packaged default is injected as-is. To disable the shipped default while keeping the roster, create an empty `ORCHESTRATOR.md`.
+
+The shipped asset is not meant to be edited in place: package updates overwrite it. Use `/workflow init` to start a copy you own.
 
 ## What it deliberately does not do
 
-It makes no routing decisions and never contacts a provider. The roster section itself contains no role or policy text; policy (which class to pick when, escalation rules, review discipline) lives in your context file, or in the packaged default workflow when you have none.
+It makes no routing decisions and never contacts a provider. The roster section itself contains no role or policy text; policy (which class to pick when, escalation rules, review discipline) lives in your `ORCHESTRATOR.md`, or in the packaged default workflow when you have none.
 
 ## Tests
 

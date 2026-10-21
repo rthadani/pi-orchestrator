@@ -2,7 +2,7 @@
 // (mtime-cached config loading) in extensions/pi-orchestrator.ts with offline
 // fixtures. No framework; throws on failure; prints PASS lines.
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,14 @@ function pass(msg) {
 function runCase(name, fn) {
   try {
     fn();
+    pass(name);
+  } catch (e) {
+    console.error(`FAIL: ${name}: ${e.message}`);
+  }
+}
+async function runCaseAsync(name, fn) {
+  try {
+    await fn();
     pass(name);
   } catch (e) {
     console.error(`FAIL: ${name}: ${e.message}`);
@@ -44,7 +52,7 @@ function inOrder(line, names) {
 // FAILOVER_CONFIG from the environment.
 delete process.env.FAILOVER_CONFIG;
 
-const { renderRoster, loadRoster, findContextFiles, renderDefaultSections, loadWorkflow, default: piRoster } = await import("../extensions/pi-orchestrator.ts");
+const { renderRoster, loadRoster, findOrchestratorFile, renderDefaultSections, loadWorkflow, default: piRoster } = await import("../extensions/pi-orchestrator.ts");
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -266,40 +274,41 @@ runCase("CASE 14: sonnet's xhigh model shows :xhigh->max", () => {
   assert(/:xhigh->max/.test(sonnet), `missing :xhigh->max in sonnet line: ${sonnet}`);
 });
 
-const FIVE = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 const sampleRoster = { section: "roster section", path: "", mtimeMs: null, disabled: null };
 
-runCase("CASE 15: context detection matrix across the five filenames and dirs", () => {
-  const wf = "packaged workflow";
-  const none = findContextFiles("/proj/sub", "/agents", () => false);
-  assert(none.length === 0, `expected no context files, got ${none.length}`);
+runCase("CASE 15: ORCHESTRATOR.md search order (cwd, parents, agent dir, nearest wins)", () => {
+  const none = findOrchestratorFile("/proj/sub", "/agents", () => false);
+  assert(none === undefined, `expected no orchestrator file, got ${none}`);
+
+  const cwdHit = "/proj/sub/ORCHESTRATOR.md";
   assert(
-    renderDefaultSections(wf, sampleRoster, none.length > 0).workflow === wf,
-    "no hits should inject the workflow",
+    findOrchestratorFile("/proj/sub", "/agents", (p) => p === cwdHit) === cwdHit,
+    "cwd hit should win",
   );
 
-  for (const filename of FIVE) {
-    for (const dir of ["/proj/sub", "/proj", "/agents"]) {
-      const hit = join(dir, filename);
-      const set = new Set([hit]);
-      const found = findContextFiles("/proj/sub", "/agents", (p) => set.has(p));
-      assert(found.length === 1, `expected one hit for ${filename} in ${dir}, got ${found.length}`);
-      assert(found[0] === hit, `wrong path for ${filename} in ${dir}: ${found[0]}`);
-      const sections = renderDefaultSections(wf, sampleRoster, found.length > 0);
-      assert(sections.workflow === null, `workflow should be suppressed by ${hit}`);
-      assert(sections.roster === "roster section", `roster must stay injected alongside ${hit}`);
-    }
-  }
+  const parentHit = "/proj/ORCHESTRATOR.md";
+  assert(
+    findOrchestratorFile("/proj/sub", "/agents", (p) => p === parentHit) === parentHit,
+    "parent hit should win",
+  );
+
+  const agentHit = "/agents/ORCHESTRATOR.md";
+  assert(
+    findOrchestratorFile("/proj/sub", "/agents", (p) => p === agentHit) === agentHit,
+    "agent dir hit should win",
+  );
+
+  const set = new Set([parentHit, agentHit]);
+  assert(
+    findOrchestratorFile("/proj/sub", "/agents", (p) => set.has(p)) === parentHit,
+    "nearer parent should beat the agent dir",
+  );
 });
 
-runCase("CASE 16: absent context injects both; present context injects roster only", () => {
-  const wf = "workflow";
-  const absent = renderDefaultSections(wf, sampleRoster, false);
-  assert(absent.workflow === wf, "absent context should inject the workflow");
-  assert(absent.roster === "roster section", "absent context should inject the roster");
-  const present = renderDefaultSections(wf, sampleRoster, true);
-  assert(present.workflow === null, "present context should leave no workflow key");
-  assert(present.roster === "roster section", "present context should still inject the roster");
+runCase("CASE 16: AGENTS.md alone does not suppress the default workflow", () => {
+  const agentsHit = "/proj/AGENTS.md";
+  const found = findOrchestratorFile("/proj/sub", "/agents", (p) => p === agentsHit);
+  assert(found === undefined, `AGENTS.md must not suppress; got ${found}`);
 });
 
 runCase("CASE 17: malformed failover leaves roster out but workflow in", () => {
@@ -309,7 +318,7 @@ runCase("CASE 17: malformed failover leaves roster out but workflow in", () => {
   const roster = loadRoster();
   assert(roster.section === "", "malformed config should yield an empty roster");
   assert(roster.disabled, "malformed config should carry a disabled reason");
-  const sections = renderDefaultSections("workflow", roster, false);
+  const sections = renderDefaultSections("workflow", roster);
   assert(sections.roster === null, "disabled roster should be omitted");
   assert(sections.workflow === "workflow", "workflow must be independent of roster failure");
 });
@@ -337,7 +346,7 @@ runCase("CASE 18: missing workflow asset yields no section and no throw", () => 
 });
 
 runCase("CASE 19: shipped workflow asset names no models or providers", () => {
-  const asset = join(here, "..", "assets", "workflow.md");
+  const asset = join(here, "..", "assets", "ORCHESTRATOR.example.md");
   const text = readFileSync(asset, "utf8");
   assert(
     !/kimi|deepseek|glm|minimax|moonshot|anthropic|openai|failover\//i.test(text),
@@ -348,7 +357,7 @@ runCase("CASE 19: shipped workflow asset names no models or providers", () => {
 runCase("CASE 20: injected workflow is non-empty when present", () => {
   const state = loadWorkflow();
   assert(state.section.length > 0, "shipped workflow asset should be non-empty");
-  const sections = renderDefaultSections(state.section, sampleRoster, false);
+  const sections = renderDefaultSections(state.section, sampleRoster);
   assert(
     typeof sections.workflow === "string" && sections.workflow.length > 0,
     "workflow section should be non-empty when injected",
@@ -377,6 +386,111 @@ runCase("CASE 21: /workflow command reports the workflow source and roster", () 
     /## Model roster|roster disabled/.test(notifyText),
     `workflow report missing roster:\n${notifyText}`,
   );
+});
+
+runCase("CASE 22: ORCHESTRATOR.md in cwd replaces the packaged default", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-orch-cwd-"));
+  const userFile = join(dir, "ORCHESTRATOR.md");
+  writeFileSync(userFile, "# my workflow\ncustom rule\n");
+  const state = loadWorkflow(dir, dir);
+  assert(state.source === "user", `expected user source, got ${state.source}`);
+  assert(state.path === userFile, `expected cwd path, got ${state.path}`);
+  assert(state.section === "# my workflow\ncustom rule\n", `unexpected section: ${state.section}`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+runCase("CASE 23: ORCHESTRATOR.md in a parent directory replaces the default", () => {
+  const parent = mkdtempSync(join(tmpdir(), "pi-orch-parent-"));
+  const child = join(parent, "sub");
+  mkdirSync(child);
+  const userFile = join(parent, "ORCHESTRATOR.md");
+  writeFileSync(userFile, "# parent workflow\n");
+  const state = loadWorkflow(child, parent);
+  assert(state.source === "user", `expected user source, got ${state.source}`);
+  assert(state.path === userFile, `expected parent path, got ${state.path}`);
+  assert(state.section === "# parent workflow\n", `unexpected section: ${state.section}`);
+  rmSync(parent, { recursive: true, force: true });
+});
+
+runCase("CASE 24: ORCHESTRATOR.md in the agent dir replaces the default", () => {
+  const agent = mkdtempSync(join(tmpdir(), "pi-orch-agent-"));
+  const cwdDir = mkdtempSync(join(tmpdir(), "pi-orch-agentcwd-"));
+  const userFile = join(agent, "ORCHESTRATOR.md");
+  writeFileSync(userFile, "# agent workflow\n");
+  const state = loadWorkflow(cwdDir, agent);
+  assert(state.source === "user", `expected user source, got ${state.source}`);
+  assert(state.path === userFile, `expected agent-dir path, got ${state.path}`);
+  assert(state.section === "# agent workflow\n", `unexpected section: ${state.section}`);
+  rmSync(agent, { recursive: true, force: true });
+  rmSync(cwdDir, { recursive: true, force: true });
+});
+
+runCase("CASE 25: nearer parent beats the agent dir when both have ORCHESTRATOR.md", () => {
+  const parent = mkdtempSync(join(tmpdir(), "pi-orch-both-parent-"));
+  const child = join(parent, "sub");
+  mkdirSync(child);
+  const agent = mkdtempSync(join(tmpdir(), "pi-orch-both-agent-"));
+  const parentFile = join(parent, "ORCHESTRATOR.md");
+  const agentFile = join(agent, "ORCHESTRATOR.md");
+  writeFileSync(parentFile, "# parent wins\n");
+  writeFileSync(agentFile, "# agent loses\n");
+  const state = loadWorkflow(child, agent);
+  assert(state.source === "user", `expected user source, got ${state.source}`);
+  assert(state.path === parentFile, `nearer parent should win, got ${state.path}`);
+  assert(state.section === "# parent wins\n", `unexpected section: ${state.section}`);
+  rmSync(parent, { recursive: true, force: true });
+  rmSync(agent, { recursive: true, force: true });
+});
+
+runCase("CASE 26: AGENTS.md alone does not suppress the default workflow", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-orch-agents-"));
+  writeFileSync(join(dir, "AGENTS.md"), "use tabs\n");
+  const state = loadWorkflow(dir, dir);
+  assert(state.source === "default", `expected default source, got ${state.source}`);
+  assert(state.section.length > 0, "default workflow should inject");
+  assert(!state.section.includes("use tabs"), "AGENTS.md content must not be treated as the workflow");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+await runCaseAsync("CASE 27: /workflow init writes the template and refuses to overwrite", async () => {
+  let handler;
+  let lastNotify = "";
+  let lastType = "";
+  const pi = {
+    on() {},
+    registerCommand(name, opts) {
+      if (name === "workflow") handler = opts.handler;
+    },
+  };
+  piRoster(pi);
+  assert(handler, "registerCommand('workflow') was not called");
+
+  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+
+  const dir = mkdtempSync(join(tmpdir(), "pi-orch-init-"));
+  const target = join(dir, "ORCHESTRATOR.md");
+  const ctx = {
+    cwd: dir,
+    ui: { notify(text, type) { lastNotify = text; lastType = type; } },
+  };
+  await handler(`init ${target}`, ctx);
+  assert(readFileSync(target, "utf8") === asset, "init did not write the example asset verbatim");
+  assert(lastNotify.includes(target), `init report missing target path:\n${lastNotify}`);
+  assert(lastType === "info", `init should report info, got ${lastType}`);
+
+  writeFileSync(target, "user edits");
+  await handler(`init ${target}`, ctx);
+  assert(readFileSync(target, "utf8") === "user edits", "second init overwrote existing file");
+  assert(lastType === "error", `second init should refuse with error, got ${lastType}`);
+  assert(/refusing to overwrite/.test(lastNotify), `refusal message missing:\n${lastNotify}`);
+
+  const dir2 = mkdtempSync(join(tmpdir(), "pi-orch-init2-"));
+  const ctx2 = { cwd: dir2, ui: { notify(text, type) { lastNotify = text; lastType = type; } } };
+  await handler("init", ctx2);
+  assert(readFileSync(join(dir2, "ORCHESTRATOR.md"), "utf8") === asset, "default-path init did not write ORCHESTRATOR.md");
+
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir2, { recursive: true, force: true });
 });
 
 rmSync(tmp, { recursive: true, force: true });
