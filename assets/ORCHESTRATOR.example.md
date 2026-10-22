@@ -215,6 +215,9 @@ subject to the opus approval rule.
 - **trivial, per step 1 → the `flash` class**
 - **non-trivial, or any carve-out area → the `coding` class**
 
+`worker`'s classes are `flash` and `coding` only; `sonnet` is for `oracle`,
+`reviewer` and `researcher`.
+
 **Mechanical operations go to `flash`, whatever their blast radius.**
 `git add`/`commit`/`push`, file moves, renames, formatting, and config
 transcription are routed by how little reasoning they need, not by how visible

@@ -1,8 +1,9 @@
-// pi-orchestrator render harness: exercises renderRoster (pure) and loadRoster
-// (mtime-cached config loading) in extensions/pi-orchestrator.ts with offline
-// fixtures. No framework; throws on failure; prints PASS lines.
+// pi-orchestrator workflow harness: exercises workflow resolution, installation
+// gating, and before_agent_start section injection in
+// extensions/pi-orchestrator.ts with offline fixtures. No framework; throws on
+// failure; prints PASS lines.
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,250 +34,21 @@ async function runCaseAsync(name, fn) {
     console.error(`FAIL: ${name}: ${e.message}`);
   }
 }
-function classLine(text, name) {
-  const line = text.split("\n").find((l) => l.startsWith(`- ${name}:`));
-  assert(line !== undefined, `missing "${name}" class line in roster:\n${text}`);
-  return line;
-}
-function inOrder(line, names) {
-  let prev = -1;
-  for (const name of names) {
-    const i = line.indexOf(name);
-    assert(i >= 0, `missing "${name}" in line: ${line}`);
-    assert(i > prev, `"${name}" out of order in line: ${line}`);
-    prev = i;
-  }
-}
 
-// Point the module's initial load at the real default config, not an inherited
-// FAILOVER_CONFIG from the environment.
-delete process.env.FAILOVER_CONFIG;
-
-const { renderRoster, loadRoster, findOrchestratorFile, renderDefaultSections, loadWorkflow, detectExtensions, missingRequired, renderDoctorReport, default: piRoster } = await import("../extensions/pi-orchestrator.ts");
+const {
+  findOrchestratorFile,
+  loadWorkflow,
+  detectExtensions,
+  missingRequired,
+  renderDoctorReport,
+  default: piRoster,
+} = await import("../extensions/pi-orchestrator.ts");
 
 const here = dirname(fileURLToPath(import.meta.url));
+const assetPath = join(here, "..", "assets", "ORCHESTRATOR.example.md");
+const asset = readFileSync(assetPath, "utf8");
 
-// --print: audit the real config's rendered roster (fresh process, before cases).
-if (process.argv.includes("--print")) {
-  const state = loadRoster();
-  console.log(state.section);
-  console.log(`config: ${state.path}`);
-  console.log(`mtime: ${state.mtimeMs ?? "missing"}`);
-  process.exit(state.section ? 0 : 1);
-}
-
-// Fixture mirroring the real failover.json catalog shape (values are enough to
-// prove ordering, dedup, and modalities without reading the real file).
-const fixture = {
-  sets: [
-    {
-      name: "opus",
-      models: [
-        { name: "glm-5.3", cost: { input: 1.4, output: 4.4 } },
-        { name: "kimi-k3", input: ["text", "image"], cost: { input: 3, output: 15 } },
-      ],
-    },
-    {
-      name: "sonnet",
-      models: [
-        {
-          name: "deepseek-v4-pro",
-          cost: { input: 0.435, output: 0.87 },
-          thinkingLevelMap: { minimal: "high", xhigh: "max" },
-        },
-        { name: "kimi-k2.6", input: ["text", "image"], cost: { input: 0.95, output: 4 } },
-      ],
-    },
-    {
-      name: "flash",
-      models: [
-        { name: "deepseek-flash", cost: { input: 0.14, output: 0.28 } },
-        { name: "MiniMax-M3.1-Flash", input: ["text", "image"], cost: { input: 0.15, output: 0.6 } },
-        { name: "glm-5.3-flash", input: ["text", "image"], cost: { input: 0.15, output: 0.5 } },
-      ],
-    },
-    {
-      name: "coding",
-      models: [
-        { name: "kimi-k2.7-code", input: ["text", "image"], cost: { input: 0.95, output: 4 } },
-        {
-          name: "deepseek-v4-pro",
-          cost: { input: 0.435, output: 0.87 },
-          thinkingLevelMap: { minimal: "high", xhigh: "max" },
-        },
-        { name: "MiniMax-M3.1-Flash", input: ["text", "image"], cost: { input: 0.15, output: 0.6 } },
-        { name: "glm-5.3-flash", input: ["text", "image"], cost: { input: 0.15, output: 0.5 } },
-      ],
-    },
-  ],
-};
-
-runCase("CASE 1: renders all four classes with the expected member order", () => {
-  const text = renderRoster(fixture);
-  inOrder(classLine(text, "opus"), ["glm-5.3", "kimi-k3"]);
-  inOrder(classLine(text, "sonnet"), ["deepseek-v4-pro", "kimi-k2.6"]);
-  inOrder(classLine(text, "flash"), ["deepseek-flash", "MiniMax-M3.1-Flash", "glm-5.3-flash"]);
-  inOrder(classLine(text, "coding"), [
-    "kimi-k2.7-code",
-    "deepseek-v4-pro",
-    "MiniMax-M3.1-Flash",
-    "glm-5.3-flash",
-  ]);
-});
-
-runCase("CASE 2: sonnet's first-listed model is deepseek-v4-pro", () => {
-  const text = renderRoster(fixture);
-  const sonnet = classLine(text, "sonnet");
-  assert(sonnet.startsWith("- sonnet: deepseek-v4-pro"), `sonnet does not lead with deepseek-v4-pro: ${sonnet}`);
-});
-
-runCase("CASE 3: a model in two sets is bare after its first occurrence", () => {
-  const text = renderRoster(fixture);
-  const sonnet = classLine(text, "sonnet");
-  const coding = classLine(text, "coding");
-  assert(sonnet.includes("deepseek-v4-pro ($"), "first occurrence should carry cost detail");
-  assert(coding.includes("-> deepseek-v4-pro ->"), "coding's deepseek-v4-pro should be a bare name");
-  assert(!coding.includes("deepseek-v4-pro ("), "coding should not repeat deepseek-v4-pro details");
-  assert(!coding.includes("MiniMax-M3.1-Flash ("), "coding should not repeat MiniMax-M3.1-Flash details");
-});
-
-runCase("CASE 4: modalities reflect the input field", () => {
-  const text = renderRoster(fixture);
-  const sonnet = classLine(text, "sonnet");
-  assert(/kimi-k2\.6 \([^)]*image/.test(sonnet), `kimi-k2.6 should show image: ${sonnet}`);
-  const opus = classLine(text, "opus");
-  assert(/glm-5\.3 \([^)]*text/.test(opus), `glm-5.3 should show text: ${opus}`);
-  assert(!/glm-5\.3 \([^)]*image/.test(opus), `glm-5.3 should not show image: ${opus}`);
-});
-
-const tmp = mkdtempSync(join(tmpdir(), "pi-roster-harness-"));
-
-runCase("CASE 5: malformed JSON yields an empty section without throwing", () => {
-  const bad = join(tmp, "bad.json");
-  writeFileSync(bad, "{ not json");
-  process.env.FAILOVER_CONFIG = bad;
-  let state;
-  let threw = false;
-  try {
-    state = loadRoster();
-  } catch {
-    threw = true;
-  }
-  assert(!threw, "loadRoster threw on malformed JSON");
-  assert(state.section === "", `expected empty section, got: ${state.section}`);
-  assert(state.disabled, "expected a disabled reason");
-});
-
-runCase("CASE 6: missing file yields an empty section without throwing", () => {
-  const missing = join(tmp, "nope.json");
-  process.env.FAILOVER_CONFIG = missing;
-  let state;
-  let threw = false;
-  try {
-    state = loadRoster();
-  } catch {
-    threw = true;
-  }
-  assert(!threw, "loadRoster threw on a missing file");
-  assert(state.section === "", `expected empty section, got: ${state.section}`);
-  assert(state.disabled, "expected a disabled reason");
-});
-
-runCase("CASE 7: FAILOVER_CONFIG is honoured", () => {
-  const custom = join(tmp, "custom.json");
-  writeFileSync(
-    custom,
-    JSON.stringify({ sets: [{ name: "customset", models: [{ name: "custom-model", input: ["text"] }] }] }),
-  );
-  process.env.FAILOVER_CONFIG = custom;
-  const state = loadRoster();
-  assert(state.section.includes("- customset:"), `FAILOVER_CONFIG ignored, got:\n${state.section}`);
-  assert(state.section.includes("custom-model"), "custom model missing from rendered roster");
-});
-
-runCase("CASE 8: wrong-shaped entries are skipped without throwing", () => {
-  const nullSet = renderRoster({ sets: [null] });
-  assert(typeof nullSet === "string", `null set: expected string, got ${typeof nullSet}`);
-  const nullModel = renderRoster({ sets: [{ models: [null] }] });
-  assert(typeof nullModel === "string", `null model: expected string, got ${typeof nullModel}`);
-  const noName = renderRoster({
-    sets: [{ name: "s", models: [{ cost: { input: 1, output: 2 } }] }],
-  });
-  assert(typeof noName === "string", `missing name: expected string, got ${typeof noName}`);
-  assert(!noName.includes("undefined"), `missing name rendered "undefined": ${noName}`);
-});
-
-runCase("CASE 9: mtime change reloads the config", () => {
-  const p = join(tmp, "reload.json");
-  const later = new Date(Date.now() + 1000);
-  writeFileSync(p, JSON.stringify({ sets: [{ name: "s", models: [{ name: "model-A" }] }] }));
-  process.env.FAILOVER_CONFIG = p;
-  const first = loadRoster();
-  assert(first.section.includes("model-A"), `first load missing model-A:\n${first.section}`);
-  writeFileSync(p, JSON.stringify({ sets: [{ name: "s", models: [{ name: "model-B" }] }] }));
-  utimesSync(p, later, later);
-  const second = loadRoster();
-  assert(second.section.includes("model-B"), `reload missing model-B:\n${second.section}`);
-  assert(!second.section.includes("model-A"), `stale model-A still present:\n${second.section}`);
-});
-
-runCase("CASE 10: malformed config warns exactly once at load", () => {
-  const bad = join(tmp, "warn.json");
-  writeFileSync(bad, "{ not json");
-  const extPath = join(here, "..", "extensions", "pi-orchestrator.ts");
-  const script = `import(${JSON.stringify(extPath)}).catch(() => process.exit(1));`;
-  const res = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-    cwd: here,
-    env: { ...process.env, FAILOVER_CONFIG: bad },
-    encoding: "utf8",
-  });
-  const warns = (res.stderr || "").split("\n").filter((l) => l.includes("[pi-orchestrator]"));
-  assert(warns.length === 1, `expected one [pi-orchestrator] warn, got ${warns.length}:\n${res.stderr}`);
-});
-
-runCase("CASE 11: /roster command reports the roster or a disabled reason", () => {
-  let handler;
-  let notifyText = "";
-  const pi = {
-    on() {},
-    registerCommand(name, opts) {
-      if (name === "roster") handler = opts.handler;
-    },
-  };
-  piRoster(pi);
-  assert(handler, "registerCommand('roster') was not called");
-  const ctx = { ui: { notify(text) { notifyText = text; } } };
-  handler({}, ctx);
-  assert(typeof notifyText === "string", "roster handler did not notify");
-  assert(
-    notifyText.includes("## Model roster") || notifyText.startsWith("roster disabled:"),
-    `unexpected roster report:\n${notifyText}`,
-  );
-});
-
-runCase("CASE 12: rendered roster carries no policy text", () => {
-  const text = renderRoster(fixture);
-  assert(text.length > 0, "rendered roster is empty");
-  assert(
-    !/must|should|escalate|review discipline|carve-out/i.test(text),
-    `policy text leaked into roster:\n${text}`,
-  );
-});
-
-runCase("CASE 13: roster section starts with the header", () => {
-  const text = renderRoster(fixture);
-  assert(text.startsWith("## Model roster"), `missing roster header:\n${text}`);
-});
-
-runCase("CASE 14: sonnet's xhigh model shows :xhigh->max", () => {
-  const text = renderRoster(fixture);
-  const sonnet = classLine(text, "sonnet");
-  assert(/:xhigh->max/.test(sonnet), `missing :xhigh->max in sonnet line: ${sonnet}`);
-});
-
-const sampleRoster = { section: "roster section", path: "", mtimeMs: null, disabled: null };
-
-runCase("CASE 15: ORCHESTRATOR.md search order (cwd, parents, agent dir, nearest wins)", () => {
+runCase("CASE 1: ORCHESTRATOR.md search order (cwd, parents, agent dir, nearest wins)", () => {
   const none = findOrchestratorFile("/proj/sub", "/agents", () => false);
   assert(none === undefined, `expected no orchestrator file, got ${none}`);
 
@@ -305,26 +77,14 @@ runCase("CASE 15: ORCHESTRATOR.md search order (cwd, parents, agent dir, nearest
   );
 });
 
-runCase("CASE 16: AGENTS.md alone does not suppress the default workflow", () => {
+runCase("CASE 2: AGENTS.md alone does not suppress the default workflow (search)", () => {
   const agentsHit = "/proj/AGENTS.md";
   const found = findOrchestratorFile("/proj/sub", "/agents", (p) => p === agentsHit);
   assert(found === undefined, `AGENTS.md must not suppress; got ${found}`);
 });
 
-runCase("CASE 17: malformed failover leaves roster out but workflow in", () => {
-  const bad = join(tmp, "bad2.json");
-  writeFileSync(bad, "{ not json");
-  process.env.FAILOVER_CONFIG = bad;
-  const roster = loadRoster();
-  assert(roster.section === "", "malformed config should yield an empty roster");
-  assert(roster.disabled, "malformed config should carry a disabled reason");
-  const sections = renderDefaultSections("workflow", roster);
-  assert(sections.roster === null, "disabled roster should be omitted");
-  assert(sections.workflow === "workflow", "workflow must be independent of roster failure");
-});
-
-runCase("CASE 18: missing workflow asset yields no section and no throw", () => {
-  const missingDir = mkdtempSync(join(tmpdir(), "pi-roster-missing-"));
+runCase("CASE 3: missing workflow asset yields no section and no throw", () => {
+  const missingDir = mkdtempSync(join(tmpdir(), "pi-workflow-missing-"));
   const copied = join(missingDir, "pi-orchestrator.ts");
   copyFileSync(join(here, "..", "extensions", "pi-orchestrator.ts"), copied);
   const script = [
@@ -345,26 +105,19 @@ runCase("CASE 18: missing workflow asset yields no section and no throw", () => 
   rmSync(missingDir, { recursive: true, force: true });
 });
 
-runCase("CASE 19: shipped workflow asset names no models or providers", () => {
-  const asset = join(here, "..", "assets", "ORCHESTRATOR.example.md");
-  const text = readFileSync(asset, "utf8");
+runCase("CASE 4: shipped workflow asset names no models or providers", () => {
   assert(
-    !/kimi|deepseek|glm|minimax|moonshot|anthropic|openai/i.test(text),
+    !/kimi|deepseek|glm|minimax|moonshot|anthropic|openai/i.test(asset),
     "workflow asset leaks a model or provider name",
   );
 });
 
-runCase("CASE 20: injected workflow is non-empty when present", () => {
+runCase("CASE 5: injected workflow is non-empty when present", () => {
   const state = loadWorkflow();
   assert(state.section.length > 0, "shipped workflow asset should be non-empty");
-  const sections = renderDefaultSections(state.section, sampleRoster);
-  assert(
-    typeof sections.workflow === "string" && sections.workflow.length > 0,
-    "workflow section should be non-empty when injected",
-  );
 });
 
-runCase("CASE 21: /workflow command reports the workflow source and roster", () => {
+runCase("CASE 6: /workflow command reports the workflow source", () => {
   let handler;
   let notifyText = "";
   const pi = {
@@ -382,13 +135,10 @@ runCase("CASE 21: /workflow command reports the workflow source and roster", () 
     /workflow source|workflow disabled/.test(notifyText),
     `unexpected workflow report:\n${notifyText}`,
   );
-  assert(
-    /## Model roster|roster disabled/.test(notifyText),
-    `workflow report missing roster:\n${notifyText}`,
-  );
+  assert(!/roster/i.test(notifyText), `workflow report must not mention a roster:\n${notifyText}`);
 });
 
-runCase("CASE 22: ORCHESTRATOR.md in cwd replaces the packaged default", () => {
+runCase("CASE 7: ORCHESTRATOR.md in cwd replaces the packaged default", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-orch-cwd-"));
   const userFile = join(dir, "ORCHESTRATOR.md");
   writeFileSync(userFile, "# my workflow\ncustom rule\n");
@@ -399,7 +149,7 @@ runCase("CASE 22: ORCHESTRATOR.md in cwd replaces the packaged default", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-runCase("CASE 23: ORCHESTRATOR.md in a parent directory replaces the default", () => {
+runCase("CASE 8: ORCHESTRATOR.md in a parent directory replaces the default", () => {
   const parent = mkdtempSync(join(tmpdir(), "pi-orch-parent-"));
   const child = join(parent, "sub");
   mkdirSync(child);
@@ -412,7 +162,7 @@ runCase("CASE 23: ORCHESTRATOR.md in a parent directory replaces the default", (
   rmSync(parent, { recursive: true, force: true });
 });
 
-runCase("CASE 24: ORCHESTRATOR.md in the agent dir replaces the default", () => {
+runCase("CASE 9: ORCHESTRATOR.md in the agent dir replaces the default", () => {
   const agent = mkdtempSync(join(tmpdir(), "pi-orch-agent-"));
   const cwdDir = mkdtempSync(join(tmpdir(), "pi-orch-agentcwd-"));
   const userFile = join(agent, "ORCHESTRATOR.md");
@@ -425,7 +175,7 @@ runCase("CASE 24: ORCHESTRATOR.md in the agent dir replaces the default", () => 
   rmSync(cwdDir, { recursive: true, force: true });
 });
 
-runCase("CASE 25: nearer parent beats the agent dir when both have ORCHESTRATOR.md", () => {
+runCase("CASE 10: nearer parent beats the agent dir when both have ORCHESTRATOR.md", () => {
   const parent = mkdtempSync(join(tmpdir(), "pi-orch-both-parent-"));
   const child = join(parent, "sub");
   mkdirSync(child);
@@ -442,7 +192,7 @@ runCase("CASE 25: nearer parent beats the agent dir when both have ORCHESTRATOR.
   rmSync(agent, { recursive: true, force: true });
 });
 
-runCase("CASE 26: AGENTS.md alone does not suppress the default workflow", () => {
+runCase("CASE 11: AGENTS.md alone does not suppress the default workflow (loading)", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-orch-agents-"));
   writeFileSync(join(dir, "AGENTS.md"), "use tabs\n");
   const state = loadWorkflow(dir, dir);
@@ -452,7 +202,7 @@ runCase("CASE 26: AGENTS.md alone does not suppress the default workflow", () =>
   rmSync(dir, { recursive: true, force: true });
 });
 
-await runCaseAsync("CASE 27: /workflow init writes the template and refuses to overwrite", async () => {
+await runCaseAsync("CASE 12: /workflow init writes the template and refuses to overwrite", async () => {
   let handler;
   let lastNotify = "";
   let lastType = "";
@@ -464,8 +214,6 @@ await runCaseAsync("CASE 27: /workflow init writes the template and refuses to o
   };
   piRoster(pi);
   assert(handler, "registerCommand('workflow') was not called");
-
-  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
 
   const dir = mkdtempSync(join(tmpdir(), "pi-orch-init-"));
   const target = join(dir, "ORCHESTRATOR.md");
@@ -493,13 +241,11 @@ await runCaseAsync("CASE 27: /workflow init writes the template and refuses to o
   rmSync(dir2, { recursive: true, force: true });
 });
 
-runCase("CASE 28: shipped asset contains no requires: markers", () => {
-  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+runCase("CASE 13: shipped asset contains no requires: markers", () => {
   assert(!asset.includes("requires:"), `asset must not contain capability markers:\n${asset}`);
 });
 
-runCase("CASE 29: shipped asset retains the full workflow detail", () => {
-  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+runCase("CASE 14: shipped asset retains the full workflow detail", () => {
   for (const needle of [
     "## Workflow",
     "## Agent roles",
@@ -520,15 +266,18 @@ runCase("CASE 29: shipped asset retains the full workflow detail", () => {
     "boomerang",
     "ctx_execute",
     "ask_user",
+    "`worker`'s classes are `flash` and `coding` only",
+    "`reviewer` and `researcher`",
   ]) {
     assert(asset.includes(needle), `asset lost detail: ${needle}`);
   }
 });
 
 // Exercise the before_agent_start handler with a controlled installed-package
-// set (settings.json `packages`) and model-registry provider set. Returns the
-// injected workflow and roster sections (undefined when omitted).
-function injectWorkflow({ packages = [], providers = [], userFile = null, settings = null }) {
+// set (settings.json `packages`) and model-registry provider set. Reports the
+// injected workflow section and whether model_roster was present on the
+// sections object before and after the handler ran.
+function injectWorkflow({ packages = [], providers = [], userFile = null, settings = null, presetRoster = null }) {
   const agentDir = mkdtempSync(join(tmpdir(), "pi-orch-agent-"));
   const workDir = mkdtempSync(join(tmpdir(), "pi-orch-work-"));
   if (userFile !== null) writeFileSync(join(workDir, "ORCHESTRATOR.md"), userFile);
@@ -555,8 +304,16 @@ function injectWorkflow({ packages = [], providers = [], userFile = null, settin
     },
   };
   const sections = {};
+  if (presetRoster !== null) sections.model_roster = presetRoster;
+  const beforeRoster = Object.prototype.hasOwnProperty.call(sections, "model_roster");
   onBefore({ systemPromptOptions: { sections } }, ctx);
-  const result = { workflow: sections.orchestrator_workflow, roster: sections.model_roster };
+  const afterRoster = Object.prototype.hasOwnProperty.call(sections, "model_roster");
+  const result = {
+    workflow: sections.orchestrator_workflow,
+    sections,
+    beforeRoster,
+    afterRoster,
+  };
   process.chdir(prevCwd);
   if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
@@ -565,8 +322,7 @@ function injectWorkflow({ packages = [], providers = [], userFile = null, settin
   return result;
 }
 
-runCase("CASE 30: packaged workflow injects only when all four required extensions are installed", () => {
-  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+runCase("CASE 15: packaged workflow injects only when all four required extensions are installed", () => {
   const required = ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"];
   const allPresent = injectWorkflow({ packages: required, providers: ["failover"] });
   assert(allPresent.workflow === asset, "all required installed should inject the full asset");
@@ -574,7 +330,7 @@ runCase("CASE 30: packaged workflow injects only when all four required extensio
   assert(missing.workflow === undefined, "missing pi-failover should withhold the workflow");
 });
 
-runCase("CASE 33: a user ORCHESTRATOR.md is injected verbatim even with all four required extensions missing", () => {
+runCase("CASE 16: a user ORCHESTRATOR.md is injected verbatim even with all four required extensions missing", () => {
   const userText = "# my workflow\ncustom rule\n";
   const result = injectWorkflow({ packages: [], providers: [], userFile: userText });
   assert(
@@ -583,13 +339,11 @@ runCase("CASE 33: a user ORCHESTRATOR.md is injected verbatim even with all four
   );
 });
 
-runCase("CASE 34: doctor marks the four required extensions and reports the withheld state", () => {
+runCase("CASE 17: doctor marks the four required extensions and reports the withheld state", () => {
   const missing = renderDoctorReport({
     available: new Set(),
     workflowSource: "default",
     workflowPath: "/assets/ORCHESTRATOR.example.md",
-    failoverFound: false,
-    failoverPath: "/none/failover.json",
     withheld: true,
     toolsSeen: new Set(),
   });
@@ -612,13 +366,13 @@ runCase("CASE 34: doctor marks the four required extensions and reports the with
     missing.includes("ask_user: optional — degrades gracefully"),
     `ask_user optional degrade line absent:\n${missing}`,
   );
+  assert(!missing.includes("roster"), `doctor must not claim roster injection:\n${missing}`);
+  assert(!missing.includes("failover config"), `doctor must not report a failover config file:\n${missing}`);
 
   const present = renderDoctorReport({
     available: new Set(["pi-subagents", "pi-boomerang", "context-mode", "pi-failover", "ask_user"]),
     workflowSource: "default",
     workflowPath: "/assets/ORCHESTRATOR.example.md",
-    failoverFound: true,
-    failoverPath: "/ok/failover.json",
     withheld: false,
     toolsSeen: new Set(["subagent", "boomerang", "ctx_execute", "ask_user"]),
   });
@@ -632,7 +386,7 @@ runCase("CASE 34: doctor marks the four required extensions and reports the with
   assert(!present.includes("WITHHELD"), `withheld should not appear when all present:\n${present}`);
 });
 
-runCase("CASE 35: detectExtensions maps installed packages and providers to capabilities", () => {
+runCase("CASE 18: detectExtensions maps installed packages and providers to capabilities", () => {
   const none = detectExtensions(() => false, () => false);
   assert(none.size === 0, `expected no extensions, got ${[...none]}`);
 
@@ -652,7 +406,7 @@ runCase("CASE 35: detectExtensions maps installed packages and providers to capa
   assert(failoverOnly.size === 1 && failoverOnly.has("pi-failover"), `provider should enable pi-failover: ${[...failoverOnly]}`);
 });
 
-runCase("CASE 36: detectExtensions returns the four required capabilities only when predicates report present", () => {
+runCase("CASE 19: detectExtensions returns the four required capabilities only when predicates report present", () => {
   const all = detectExtensions(() => true, () => true);
   for (const cap of ["pi-subagents", "pi-boomerang", "context-mode", "pi-failover"]) {
     assert(all.has(cap), `missing required capability ${cap}`);
@@ -673,7 +427,7 @@ runCase("CASE 36: detectExtensions returns the four required capabilities only w
   assert(providerSubset.size === 1 && providerSubset.has("pi-failover"), `provider-only subset wrong: ${[...providerSubset]}`);
 });
 
-runCase("CASE 37: the required set is exactly the four, with ask_user excluded", () => {
+runCase("CASE 20: the required set is exactly the four, with ask_user excluded", () => {
   const required = missingRequired(new Set());
   const names = required.map((def) => def.capability).sort();
   assert(
@@ -683,8 +437,7 @@ runCase("CASE 37: the required set is exactly the four, with ask_user excluded",
   assert(!required.some((def) => def.capability === "ask_user"), "ask_user must not be required");
 });
 
-runCase("CASE 38: missing any one required extension withholds; installed packages without tools still inject", () => {
-  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
+runCase("CASE 21: missing any one required extension withholds; installed packages without tools still inject", () => {
   const requiredPackages = ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"];
   const cases = [
     { missing: "pi-subagents", packages: ["npm:pi-boomerang", "npm:context-mode"], providers: ["failover"] },
@@ -710,9 +463,7 @@ runCase("CASE 38: missing any one required extension withholds; installed packag
   assert(noTools.workflow === asset, "installed packages with no runtime tools must still inject");
 });
 
-runCase("CASE 39: unreadable settings or missing modelRegistry fails open and still injects", () => {
-  const asset = readFileSync(join(here, "..", "assets", "ORCHESTRATOR.example.md"), "utf8");
-
+runCase("CASE 22: unreadable settings or missing modelRegistry fails open and still injects", () => {
   const badSettings = injectWorkflow({ packages: [], providers: ["failover"], settings: "{ not json" });
   assert(badSettings.workflow === asset, "unreadable settings should fail open and inject");
 
@@ -747,7 +498,35 @@ runCase("CASE 39: unreadable settings or missing modelRegistry fails open and st
   rmSync(workDir, { recursive: true, force: true });
 });
 
-rmSync(tmp, { recursive: true, force: true });
+runCase("CASE 23: before_agent_start sets orchestrator_workflow when gating passes", () => {
+  const requiredPackages = ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"];
+  const result = injectWorkflow({ packages: requiredPackages, providers: ["failover"] });
+  assert(result.workflow === asset, "gating-passed handler should inject the full asset");
+  assert(
+    Object.prototype.hasOwnProperty.call(result.sections, "orchestrator_workflow"),
+    "orchestrator_workflow key must be present when gating passes",
+  );
+});
+
+runCase("CASE 24: before_agent_start never sets and never deletes model_roster", () => {
+  const requiredPackages = ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"];
+
+  const absent = injectWorkflow({ packages: requiredPackages, providers: ["failover"] });
+  assert(!absent.beforeRoster, "model_roster must be absent before the handler runs");
+  assert(!absent.afterRoster, "model_roster must be absent after the handler runs");
+
+  const preset = injectWorkflow({
+    packages: requiredPackages,
+    providers: ["failover"],
+    presetRoster: "pi-failover roster section",
+  });
+  assert(preset.beforeRoster, "model_roster should be present before the handler runs");
+  assert(preset.afterRoster, "handler must not delete a pre-existing model_roster");
+  assert(
+    preset.sections.model_roster === "pi-failover roster section",
+    `handler must not alter a pre-existing model_roster, got:\n${preset.sections.model_roster}`,
+  );
+});
 
 if (failures > 0) {
   console.error(`${failures} case(s) failed`);

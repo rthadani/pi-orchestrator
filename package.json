@@ -1,8 +1,8 @@
 {
   "name": "@rthadani/pi-orchestrator",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": false,
-  "description": "A pi extension that ships a default agent workflow, injects it into the system prompt, and renders your failover.json into a model roster so the workflow can name capability classes instead of models.",
+  "description": "A pi extension that ships a default agent workflow and injects it into the system prompt.",
   "keywords": ["pi-package", "pi", "orchestrator", "workflow", "subagents", "failover", "models", "roster", "prompt"],
   "publishConfig": { "access": "public" },
   "license": "MIT",

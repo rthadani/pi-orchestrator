@@ -1,19 +1,18 @@
 /**
- * pi-orchestrator: inject the failover.json model catalog and, when the user has
- * no ORCHESTRATOR.md, the full default workflow into the system prompt.
+ * pi-orchestrator: inject the workflow section into the system prompt.
  *
  * The workflow file names capability classes (opus, sonnet, flash, coding)
- * rather than models; the roster section lists which models each class contains.
- * A user's own ORCHESTRATOR.md (found in cwd, any parent directory, or the
- * agent dir, nearest first) replaces the packaged default outright; the two are
- * never injected together. pi loads its own context files separately, so those
- * do not suppress this workflow. The roster is always injected from failover.json.
- * The packaged workflow is injected only when all four required companion
- * extensions are installed; a missing one withholds it (the roster still injects).
- * Installation is read from pi's settings packages plus the model registry's
- * `failover` provider, not from runtime tool visibility. /workflow doctor reports
- * what is installed and whether the workflow is withheld. A user's own
- * ORCHESTRATOR.md is always injected verbatim, never withheld.
+ * rather than models; pi-failover owns and injects the model roster section,
+ * which lists which models each class contains. A user's own ORCHESTRATOR.md
+ * (found in cwd, any parent directory, or the agent dir, nearest first)
+ * replaces the packaged default outright; the two are never injected together.
+ * pi loads its own context files separately, so those do not suppress this
+ * workflow. The packaged workflow is injected only when all four required
+ * companion extensions are installed; a missing one withholds it. Installation
+ * is read from pi's settings packages plus the model registry's `failover`
+ * provider, not from runtime tool visibility. /workflow doctor reports what is
+ * installed and whether the workflow is withheld. A user's own ORCHESTRATOR.md
+ * is always injected verbatim, never withheld.
  *
  * Warning: a class name is not a model string. Pass `failover/<model-name>`;
  * `failover/<class>` does not resolve to that class and falls back to the
@@ -26,92 +25,6 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-interface FailoverModel {
-  name: string;
-  input?: ("text" | "image")[];
-  cost?: { input?: number; output?: number };
-  thinkingLevelMap?: Record<string, string>;
-}
-
-interface FailoverSet {
-  name: string;
-  models: FailoverModel[];
-}
-
-export interface FailoverConfig {
-  sets: FailoverSet[];
-}
-
-export interface RosterState {
-  /** The rendered roster section, or "" when the config could not be read. */
-  section: string;
-  /** The resolved config path. */
-  path: string;
-  /** File mtime in ms, or null when the file is missing. */
-  mtimeMs: number | null;
-  /** Why the roster is disabled, or null when a section was rendered. */
-  disabled: string | null;
-}
-
-const ROSTER_HEADER = [
-  "## Model roster (from failover.json)",
-  "`failover/<name>` resolves to the first set containing the name; requests fail",
-  "over circularly within that class and never cross classes. Image requests skip",
-  "backends without image support.",
-].join("\n");
-
-/** Absent `input` means text-only; an `image` entry means text+image. */
-function modalityLabel(model: FailoverModel): string {
-  return (model.input ?? ["text"]).includes("image") ? "text+image" : "text";
-}
-
-function formatModel(model: FailoverModel): string {
-  const parts: string[] = [];
-  if (model.cost && typeof model.cost.input === "number" && typeof model.cost.output === "number") {
-    parts.push(`$${model.cost.input}/$${model.cost.output}`);
-  }
-  parts.push(modalityLabel(model));
-  const mappedEffort = model.thinkingLevelMap?.["xhigh"];
-  if (mappedEffort) parts.push(`:xhigh->${mappedEffort}`);
-  return `${model.name} (${parts.join(", ")})`;
-}
-
-/**
- * Render the roster section from a parsed config. Pure: no runtime imports, no
- * I/O, so it can be exercised offline. A model that appears in more than one
- * set is printed with full details the first time and as a bare name after.
- */
-export function renderRoster(config: FailoverConfig): string {
-  if (!config?.sets?.length) return "";
-  const seen = new Set<string>();
-  const lines: string[] = [];
-  for (const set of config.sets) {
-    if (set === null || typeof set !== "object") continue;
-    if (typeof set.name !== "string" || set.name.trim() === "") continue;
-    const models = Array.isArray(set.models) ? set.models : [];
-    if (models.length === 0) continue;
-    const members: string[] = [];
-    for (const model of models) {
-      if (model === null || typeof model !== "object") continue;
-      if (typeof model.name !== "string" || model.name.trim() === "") continue;
-      if (seen.has(model.name)) {
-        members.push(model.name);
-        continue;
-      }
-      seen.add(model.name);
-      members.push(formatModel(model));
-    }
-    if (members.length === 0) continue;
-    lines.push(`- ${set.name}: ${members.join(" -> ")}`);
-  }
-  if (lines.length === 0) return "";
-  return `${ROSTER_HEADER}\n${lines.join("\n")}`;
-}
-
-function configPath(): string {
-  return process.env.FAILOVER_CONFIG || join(homedir(), ".pi", "agent", "failover.json");
-}
-
 function mtimeOf(path: string): number | null {
   try {
     return statSync(path).mtimeMs;
@@ -122,60 +35,6 @@ function mtimeOf(path: string): number | null {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function buildRoster(path: string, mtimeMs: number | null): RosterState {
-  if (mtimeMs === null) {
-    return { section: "", path, mtimeMs: null, disabled: "config file missing" };
-  }
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch (error) {
-    return { section: "", path, mtimeMs, disabled: `unreadable: ${describeError(error)}` };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    return { section: "", path, mtimeMs, disabled: `invalid JSON: ${describeError(error)}` };
-  }
-  const config = parsed as FailoverConfig;
-  if (!config || !Array.isArray(config.sets) || config.sets.length === 0) {
-    return { section: "", path, mtimeMs, disabled: "config has no model sets" };
-  }
-  let section: string;
-  try {
-    section = renderRoster(config);
-  } catch (error) {
-    return { section: "", path, mtimeMs, disabled: `invalid config: ${describeError(error)}` };
-  }
-  if (!section) {
-    return { section: "", path, mtimeMs, disabled: "no models to list" };
-  }
-  return { section, path, mtimeMs, disabled: null };
-}
-
-let cache: RosterState | null = null;
-
-/**
- * Resolve, read, and render the roster, caching the rendered section and only
- * re-reading when the file's mtime changes (or the path changes). Never throws;
- * a broken config yields an empty section with a `disabled` reason.
- */
-export function loadRoster(): RosterState {
-  const path = configPath();
-  const mtimeMs = mtimeOf(path);
-  if (cache && cache.path === path && cache.mtimeMs === mtimeMs) {
-    return cache;
-  }
-  cache = buildRoster(path, mtimeMs);
-  return cache;
-}
-
-function rosterReport(state: RosterState): string {
-  const meta = `config: ${state.path}\nmtime: ${state.mtimeMs ?? "missing"}`;
-  return state.section ? `${state.section}\n${meta}` : `roster disabled: ${state.disabled}\n${meta}`;
 }
 
 function agentDir(): string {
@@ -282,31 +141,8 @@ export function loadWorkflow(cwd?: string, agentDirPath?: string): WorkflowState
   return workflowCache;
 }
 
-export interface DefaultSections {
-  /** The workflow text to inject, or null when it must be omitted. */
-  workflow: string | null;
-  /** The roster text to inject, or null when it must be omitted. */
-  roster: string | null;
-}
-
-/**
- * Decide which sections to inject. Pure, no fs: the workflow text (user file or
- * packaged default, already resolved by loadWorkflow) is injected when
- * non-empty; the roster is omitted only when disabled.
- */
-export function renderDefaultSections(
-  workflowText: string,
-  rosterState: RosterState,
-): DefaultSections {
-  return {
-    workflow: workflowText || null,
-    roster: rosterState.section || null,
-  };
-}
-
 function workflowReport(): string {
   const workflow = loadWorkflow();
-  const roster = loadRoster();
 
   const lines: string[] = [];
   if (workflow.source === "user") {
@@ -321,23 +157,14 @@ function workflowReport(): string {
     lines.push(`workflow disabled: ${workflow.disabled}`);
     lines.push(`asset: ${workflow.path}`);
   }
-  lines.push("");
-  lines.push(rosterReport(roster));
   return lines.join("\n");
 }
 
-// Load once at extension load time so a broken config or missing asset warns
-// immediately, exactly once.
-const initialState = loadRoster();
-if (initialState.disabled) {
-  console.warn(`[pi-orchestrator] roster disabled: ${initialState.disabled}`);
-}
+// Load once at extension load time so a missing asset warns immediately,
+// exactly once.
 const initialWorkflow = loadWorkflow();
 if (initialWorkflow.disabled) {
   console.warn(`[pi-orchestrator] workflow disabled: ${initialWorkflow.disabled}`);
-}
-if (process.env.ROSTER_DEBUG) {
-  console.log(`[pi-orchestrator]\n${rosterReport(initialState)}`);
 }
 if (process.env.ORCHESTRATOR_DEBUG) {
   console.log(`[pi-orchestrator]\n${workflowReport()}`);
@@ -523,8 +350,6 @@ export interface DoctorState {
   available: ReadonlySet<string>;
   workflowSource: "user" | "default";
   workflowPath: string;
-  failoverFound: boolean;
-  failoverPath: string;
   /** Whether the packaged workflow is currently withheld for missing extensions. */
   withheld: boolean;
   /** Runtime tool names seen via pi.getAllTools(); informational, never a gate. */
@@ -571,7 +396,7 @@ export function renderDoctorReport(state: DoctorState): string {
       `workflow override: user ORCHESTRATOR.md (${state.workflowPath}); injected verbatim, never withheld`,
     );
   } else if (state.withheld) {
-    lines.push("workflow status: WITHHELD — required extensions are missing; the roster still injects");
+    lines.push("workflow status: WITHHELD — required extensions are missing");
   } else {
     lines.push("workflow status: injecting (packaged default; all required extensions installed)");
   }
@@ -588,38 +413,23 @@ export function renderDoctorReport(state: DoctorState): string {
   } else {
     lines.push("runtime tools: unavailable (informational, not a gate)");
   }
-  lines.push("");
-  if (state.failoverFound) {
-    lines.push(`failover config: found (${state.failoverPath})`);
-  } else {
-    lines.push(`failover config: not found (${state.failoverPath})`);
-  }
   return lines.join("\n");
 }
 
 export default function piRoster(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event, ctx) => {
-    const rosterState = loadRoster();
     const workflowState = loadWorkflow();
 
     const present = detectPresent(ctx);
     const missing = present === null ? null : missingRequired(present);
     // Fail open when detection is unavailable; a user's own file is never withheld.
     const withhold = missing !== null && missing.length > 0 && workflowState.source !== "user";
-    const sections = renderDefaultSections(
-      workflowState.section && !withhold ? workflowState.section : "",
-      rosterState,
-    );
 
-    if (sections.workflow) {
-      event.systemPromptOptions.sections.orchestrator_workflow = sections.workflow;
+    const workflowSection = workflowState.section && !withhold ? workflowState.section : "";
+    if (workflowSection) {
+      event.systemPromptOptions.sections.orchestrator_workflow = workflowSection;
     } else {
       delete event.systemPromptOptions.sections.orchestrator_workflow;
-    }
-    if (sections.roster) {
-      event.systemPromptOptions.sections.model_roster = sections.roster;
-    } else {
-      delete event.systemPromptOptions.sections.model_roster;
     }
 
     if (missing === null) {
@@ -629,15 +439,8 @@ export default function piRoster(pi: ExtensionAPI): void {
     }
   });
 
-  pi.registerCommand("roster", {
-    description: "Show the model roster rendered from failover.json",
-    handler: async (_args, ctx) => {
-      ctx.ui.notify(rosterReport(loadRoster()), "info");
-    },
-  });
-
   pi.registerCommand("workflow", {
-    description: "Show workflow source and roster; `init` copies the template; `doctor` audits required extensions",
+    description: "Show workflow source; `init` copies the template; `doctor` audits required extensions",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       if (tokens[0] === "doctor") {
@@ -650,7 +453,6 @@ export default function piRoster(pi: ExtensionAPI): void {
           return;
         }
         const workflow = loadWorkflow();
-        const roster = loadRoster();
         const missing = missingRequired(present);
         const withheld = missing.length > 0 && workflow.source !== "user";
         ctx.ui.notify(
@@ -658,8 +460,6 @@ export default function piRoster(pi: ExtensionAPI): void {
             available: present,
             workflowSource: workflow.source,
             workflowPath: workflow.path,
-            failoverFound: roster.disabled !== "config file missing",
-            failoverPath: roster.path,
             withheld,
             toolsSeen: collectToolNames(pi),
           }),
