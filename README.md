@@ -124,7 +124,7 @@ It makes no routing decisions and never contacts a provider. The roster section 
 
 ## Publishing
 
-Publishing happens from CI when a version tag is pushed. The maintainer bumps `version` in package.json, commits, then runs `git tag v<version> && git push origin v<version>`. The workflow refuses to publish if the tag and the package version disagree. It requires an `NPM_TOKEN` repository secret with publish rights to the `@rthadani` scope. Provenance requires the repository to be public.
+Publishing happens from CI when a version tag is pushed. The maintainer bumps `version` in package.json, commits, then runs `git tag v<version> && git push origin v<version>`. The workflow refuses to publish if the tag and the package version disagree. It requires an `NPM_TOKEN` repository secret with publish rights to the `@rthadani` scope; when the secret is missing, the workflow fails with a clear error before publishing. A manual run (`workflow_dispatch`) defaults to a dry run and uploads nothing unless you set `dry_run` to `false`; tag pushes publish for real. Provenance requires the repository to be public.
 
 ## Tests
 

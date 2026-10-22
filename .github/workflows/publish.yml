@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run npm publish with --dry-run and upload nothing'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -30,7 +35,23 @@ jobs:
           fi
       - name: Run tests
         run: node test/roster-render.test.mjs
-      - name: Publish to npm
-        run: npm publish --provenance --access public
+      - name: Require NPM_TOKEN
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::error::NPM_TOKEN is not set. Add an npm automation token with publish rights to the @rthadi scope as a repository secret (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          echo "NPM_TOKEN is present"
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          dry_run="${{ inputs.dry_run }}"
+          if [ "$dry_run" = "true" ]; then
+            echo "dry run: no package will be uploaded"
+            npm publish --provenance --access public --dry-run
+          else
+            npm publish --provenance --access public
+          fi
