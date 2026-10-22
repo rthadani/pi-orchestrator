@@ -35,23 +35,14 @@ jobs:
           fi
       - name: Run tests
         run: node test/roster-render.test.mjs
-      - name: Require NPM_TOKEN
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::error::NPM_TOKEN is not set. Add an npm automation token with publish rights to the @rthadani scope as a repository secret (Settings > Secrets and variables > Actions)."
-            exit 1
-          fi
-          echo "NPM_TOKEN is present"
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@^11.5.1
       - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           dry_run="${{ inputs.dry_run }}"
           if [ "$dry_run" = "true" ]; then
             echo "dry run: no package will be uploaded"
-            npm publish --provenance --access public --dry-run
+            npm publish --access public --dry-run
           else
-            npm publish --provenance --access public
+            npm publish --access public
           fi

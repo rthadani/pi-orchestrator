@@ -124,7 +124,11 @@ It makes no routing decisions and never contacts a provider. The roster section 
 
 ## Publishing
 
-Publishing happens from CI when a version tag is pushed. The maintainer bumps `version` in package.json, commits, then runs `git tag v<version> && git push origin v<version>`. The workflow refuses to publish if the tag and the package version disagree. It requires an `NPM_TOKEN` repository secret with publish rights to the `@rthadani` scope; when the secret is missing, the workflow fails with a clear error before publishing. A manual run (`workflow_dispatch`) defaults to a dry run and uploads nothing unless you set `dry_run` to `false`; tag pushes publish for real. Provenance requires the repository to be public.
+Publishing authenticates with npm Trusted Publishing (OIDC): no npm token is stored in this repository, and provenance is generated automatically.
+
+**One-time bootstrap (hard prerequisite):** npm cannot create a brand-new package over OIDC, so the first version must be published once outside this workflow (per npm's own guidance). After that first publish, every later version publishes from CI. Register the trusted publisher on npmjs.com: package Settings -> Trusted Publishing -> GitHub Actions, with user `rthadani`, repository `pi-orchestrator`, workflow filename `publish.yml`, and an empty environment. The workflow filename is part of the trust binding: renaming or moving `.github/workflows/publish.yml` breaks publishing until the registration is updated.
+
+Publishing happens from CI when a version tag is pushed: the maintainer bumps `version` in package.json, commits, then runs `git tag v<version> && git push origin v<version>`. The workflow refuses to publish if the tag and the package version disagree. A manual run (`workflow_dispatch`) defaults to a dry run and uploads nothing; a `v*` tag publishes for real. Requirements: npm CLI >= 11.5.1 (the workflow upgrades npm itself) and a public repository.
 
 ## Tests
 
