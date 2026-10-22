@@ -40,7 +40,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::error::NPM_TOKEN is not set. Add an npm automation token with publish rights to the @rthadi scope as a repository secret (Settings > Secrets and variables > Actions)."
+            echo "::error::NPM_TOKEN is not set. Add an npm automation token with publish rights to the @rthadani scope as a repository secret (Settings > Secrets and variables > Actions)."
             exit 1
           fi
           echo "NPM_TOKEN is present"
