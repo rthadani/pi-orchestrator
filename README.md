@@ -122,6 +122,10 @@ installed.
 
 It makes no routing decisions and never contacts a provider. The roster section itself contains no role or policy text; policy (which class to pick when, escalation rules, review discipline) lives in your `ORCHESTRATOR.md`, or in the packaged default workflow when you have none.
 
+## Publishing
+
+Publishing happens from CI when a version tag is pushed. The maintainer bumps `version` in package.json, commits, then runs `git tag v<version> && git push origin v<version>`. The workflow refuses to publish if the tag and the package version disagree. It requires an `NPM_TOKEN` repository secret with publish rights to the `@rthadani` scope. Provenance requires the repository to be public.
+
 ## Tests
 
 ```
