@@ -684,8 +684,11 @@ export default function piRoster(pi: ExtensionAPI): void {
     const toolName = (event as { toolName?: string }).toolName ?? "";
 
     if (toolName === "subagent") {
-      // Mark before deciding: spawning is always allowed, and it opens the gate.
-      gate.spawnStarted(session);
+      // Only a real spawn opens the gate. Management calls (`action: "status"`,
+      // "steer", "pending", "interrupt") are not delegation and must not
+      // unlock file tools.
+      const action = (event as { input?: { action?: unknown } }).input?.action;
+      if (action === undefined) gate.spawnStarted(session);
       return;
     }
 

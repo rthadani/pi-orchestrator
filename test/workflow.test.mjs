@@ -693,7 +693,7 @@ function gateHarness({ userFile = "# workflow\ndelegate first\n", packages = nul
         messageType: type,
         systemPromptOptions: { sections: {}, contextFiles: [] },
       }),
-    toolCall: (sessionId, toolName) => call("tool_call", sessionId, { toolName, input: {} }),
+    toolCall: (sessionId, toolName, input = {}) => call("tool_call", sessionId, { toolName, input }),
     toolEnd: (sessionId, toolName, isError = false) =>
       call("tool_execution_end", sessionId, { toolName, isError, toolCallId: "t" }),
     cleanup: () => {
@@ -804,6 +804,29 @@ await runCaseAsync("CASE 35: an unknown run type never arms the gate", async () 
   try {
     await h.start("s-nomt", "other");
     assert((await h.toolCall("s-nomt", "read")) === undefined, "only an explicit user run may arm the gate");
+  } finally {
+    h.cleanup();
+  }
+});
+
+await runCaseAsync("CASE 36: a subagent management action does not open the gate", async () => {
+  const h = gateHarness();
+  try {
+    await h.start("s-mgmt");
+    assert(
+      (await h.toolCall("s-mgmt", "read"))?.block === true,
+      "read must be blocked before any call",
+    );
+    assert(
+      (await h.toolCall("s-mgmt", "subagent", { action: "status" })) === undefined,
+      "a management action must not itself be blocked",
+    );
+    assert(
+      (await h.toolCall("s-mgmt", "read"))?.block === true,
+      "a management action must not open the gate",
+    );
+    assert((await h.toolCall("s-mgmt", "subagent")) === undefined, "a real spawn must pass");
+    assert((await h.toolCall("s-mgmt", "read")) === undefined, "a real spawn must open the gate");
   } finally {
     h.cleanup();
   }
