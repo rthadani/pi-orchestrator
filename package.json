@@ -1,6 +1,6 @@
 {
   "name": "@rthadani/pi-orchestrator",
-  "version": "2.1.2",
+  "version": "2.2.0",
   "private": false,
   "description": "A pi extension that ships a default agent workflow, injects it where an AGENTS.md goes, and enforces delegation before direct file work.",
   "keywords": [
