@@ -41,6 +41,9 @@ const {
   detectExtensions,
   missingRequired,
   renderDoctorReport,
+  applyWorkflowToPrompt,
+  decideToolGate,
+  enforcementEnabled,
   default: piRoster,
 } = await import("../extensions/pi-orchestrator.ts");
 
@@ -275,9 +278,19 @@ runCase("CASE 14: shipped asset retains the full workflow detail", () => {
 
 // Exercise the before_agent_start handler with a controlled installed-package
 // set (settings.json `packages`) and model-registry provider set. Reports the
-// injected workflow section and whether model_roster was present on the
-// sections object before and after the handler ran.
-function injectWorkflow({ packages = [], providers = [], userFile = null, settings = null, presetRoster = null }) {
+// context files the handler added (the workflow now rides in
+// <project_instructions>, the same slot as an AGENTS.md) and whether
+// model_roster was present on the sections object before and after the run.
+function injectWorkflow({
+  packages = [],
+  providers = [],
+  userFile = null,
+  settings = null,
+  presetRoster = null,
+  presetContextFiles = [],
+  sessionId = "inject-session",
+  messageType = "user",
+} = {}) {
   const agentDir = mkdtempSync(join(tmpdir(), "pi-orch-agent-"));
   const workDir = mkdtempSync(join(tmpdir(), "pi-orch-work-"));
   if (userFile !== null) writeFileSync(join(workDir, "ORCHESTRATOR.md"), userFile);
@@ -299,17 +312,24 @@ function injectWorkflow({ packages = [], providers = [], userFile = null, settin
   piRoster(pi);
   assert(onBefore, "before_agent_start handler was not registered");
   const ctx = {
+    cwd: workDir,
+    sessionManager: { getSessionId: () => sessionId },
     modelRegistry: {
       getProvider: (name) => (providers.includes(name) ? { name } : undefined),
     },
   };
   const sections = {};
   if (presetRoster !== null) sections.model_roster = presetRoster;
+  const contextFiles = [...presetContextFiles];
   const beforeRoster = Object.prototype.hasOwnProperty.call(sections, "model_roster");
-  onBefore({ systemPromptOptions: { sections } }, ctx);
+  const countBefore = contextFiles.length;
+  onBefore({ messageType, systemPromptOptions: { sections, contextFiles } }, ctx);
+  const added = contextFiles.slice(countBefore);
   const afterRoster = Object.prototype.hasOwnProperty.call(sections, "model_roster");
   const result = {
-    workflow: sections.orchestrator_workflow,
+    workflow: added.length === 1 ? added[0].content : added.length === 0 ? undefined : "DUPLICATE",
+    added,
+    contextFiles,
     sections,
     beforeRoster,
     afterRoster,
@@ -486,9 +506,15 @@ runCase("CASE 22: unreadable settings or missing modelRegistry fails open and st
       registerCommand() {},
     };
     piRoster(pi);
-    const sections = {};
-    onBefore({ systemPromptOptions: { sections } }, {});
-    assert(sections.orchestrator_workflow === asset, "missing modelRegistry should fail open and inject");
+    const contextFiles = [];
+    onBefore(
+      { messageType: "user", systemPromptOptions: { sections: {}, contextFiles } },
+      { cwd: workDir, sessionManager: { getSessionId: () => "failopen" } },
+    );
+    assert(
+      contextFiles.length === 1 && contextFiles[0].content === asset,
+      "missing modelRegistry should fail open and inject",
+    );
   } finally {
     process.chdir(prevCwd);
     if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -498,14 +524,107 @@ runCase("CASE 22: unreadable settings or missing modelRegistry fails open and st
   rmSync(workDir, { recursive: true, force: true });
 });
 
-runCase("CASE 23: before_agent_start sets orchestrator_workflow when gating passes", () => {
+runCase("CASE 23: the workflow is placed in project_instructions, never in a prompt section", () => {
   const requiredPackages = ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"];
   const result = injectWorkflow({ packages: requiredPackages, providers: ["failover"] });
   assert(result.workflow === asset, "gating-passed handler should inject the full asset");
   assert(
-    Object.prototype.hasOwnProperty.call(result.sections, "orchestrator_workflow"),
-    "orchestrator_workflow key must be present when gating passes",
+    result.added[0].path.endsWith("ORCHESTRATOR.example.md") || result.added[0].path.endsWith("ORCHESTRATOR.md"),
+    `unexpected context file path: ${result.added[0].path}`,
   );
+  assert(
+    !Object.prototype.hasOwnProperty.call(result.sections, "orchestrator_workflow"),
+    "the legacy orchestrator_workflow section must not be set",
+  );
+});
+
+runCase("CASE 23b: a stale legacy orchestrator_workflow section is removed", () => {
+  const requiredPackages = ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"];
+  const result = injectWorkflow({ packages: requiredPackages, providers: ["failover"] });
+  assert(
+    !Object.prototype.hasOwnProperty.call(result.sections, "orchestrator_workflow"),
+    "legacy section should be deleted from the prompt",
+  );
+
+  const sections = { orchestrator_workflow: "stale copy" };
+  const contextFiles = [];
+  applyWorkflowToPrompt(
+    { sections, contextFiles },
+    { section: "fresh", path: "/x/ORCHESTRATOR.md", mtimeMs: 1, disabled: null, source: "user" },
+    true,
+  );
+  assert(!("orchestrator_workflow" in sections), "legacy key must be deleted on sight");
+  assert(contextFiles.length === 1 && contextFiles[0].content === "fresh", "fresh workflow must be added");
+});
+
+runCase("CASE 23c: injection is idempotent across repeated runs", () => {
+  const workflow = { section: "w", path: "/x/ORCHESTRATOR.md", mtimeMs: 1, disabled: null, source: "user" };
+  const options = { sections: {}, contextFiles: [] };
+  applyWorkflowToPrompt(options, workflow, true);
+  applyWorkflowToPrompt(options, workflow, true);
+  applyWorkflowToPrompt(options, workflow, true);
+  assert(options.contextFiles.length === 1, `expected one entry, got ${options.contextFiles.length}`);
+
+  applyWorkflowToPrompt(options, workflow, false);
+  assert(options.contextFiles.length === 0, "a withheld workflow must remove its entry");
+});
+
+runCase("CASE 25: the gate blocks reads and writes for a top-level session with no spawn", () => {
+  for (const toolName of ["read", "grep", "find", "ls", "bash", "edit", "write", "codemode", "lsp_hover", "ctx_execute"]) {
+    const decision = decideToolGate({
+      toolName,
+      active: true,
+      enforce: true,
+      topLevel: true,
+      spawnInFlight: false,
+      delegated: false,
+    });
+    assert(decision.block, `${toolName} should be blocked before a spawn`);
+    assert(/delegation/i.test(decision.reason ?? ""), `${toolName} block reason must explain delegation`);
+  }
+});
+
+runCase("CASE 26: the gate always allows spawning, asking, and unknown non-file tools", () => {
+  for (const toolName of ["subagent", "ask_user", "boomerang", "todo"]) {
+    const decision = decideToolGate({
+      toolName,
+      active: true,
+      enforce: true,
+      topLevel: true,
+      spawnInFlight: false,
+      delegated: false,
+    });
+    assert(!decision.block, `${toolName} must not be blocked`);
+  }
+});
+
+runCase("CASE 27: the gate opens after a spawn, exempts children, and respects the off switch", () => {
+  const base = { active: true, enforce: true, topLevel: true, spawnInFlight: false };
+  assert(!decideToolGate({ ...base, toolName: "read", delegated: true }).block, "delegated session must be open");
+  assert(
+    !decideToolGate({ ...base, topLevel: false, toolName: "read", delegated: false }).block,
+    "child sessions must be exempt",
+  );
+  assert(
+    !decideToolGate({ ...base, spawnInFlight: true, toolName: "read", delegated: false }).block,
+    "calls made while a spawn is in flight must pass",
+  );
+  assert(
+    !decideToolGate({ ...base, enforce: false, toolName: "edit", delegated: false }).block,
+    "WORKFLOW_ENFORCE=off must disable the gate",
+  );
+  assert(
+    !decideToolGate({ ...base, active: false, toolName: "edit", delegated: false }).block,
+    "a withheld workflow must not be enforced",
+  );
+});
+
+runCase("CASE 28: WORKFLOW_ENFORCE parsing accepts only explicit off values", () => {
+  assert(enforcementEnabled({}) === true, "unset must enforce");
+  assert(enforcementEnabled({ WORKFLOW_ENFORCE: "on" }) === true, "'on' must enforce");
+  for (const value of ["off", "0", "false", "no", " OFF "]) {
+    assert(enforcementEnabled({ WORKFLOW_ENFORCE: value }) === false, `${value} must disable`);
+  }
 });
 
 runCase("CASE 24: before_agent_start never sets and never deletes model_roster", () => {
@@ -526,6 +645,145 @@ runCase("CASE 24: before_agent_start never sets and never deletes model_roster",
     preset.sections.model_roster === "pi-failover roster section",
     `handler must not alter a pre-existing model_roster, got:\n${preset.sections.model_roster}`,
   );
+});
+
+// Drive the real handlers through a fake pi: before_agent_start, then a
+// sequence of tool_call / tool_execution_end events for named sessions.
+function gateHarness({ userFile = "# workflow\ndelegate first\n", packages = null, providers = ["failover"], messageType = "user" } = {}) {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-orch-gate-"));
+  const workDir = mkdtempSync(join(tmpdir(), "pi-orch-gatew-"));
+  if (userFile !== null) writeFileSync(join(workDir, "ORCHESTRATOR.md"), userFile);
+  writeFileSync(
+    join(agentDir, "settings.json"),
+    JSON.stringify({ packages: packages ?? ["npm:pi-subagents", "npm:pi-boomerang", "npm:context-mode"] }),
+  );
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+
+  const handlers = new Map();
+  const pi = {
+    on(event, cb) {
+      const list = handlers.get(event) ?? [];
+      list.push(cb);
+      handlers.set(event, list);
+    },
+    registerCommand() {},
+  };
+  piRoster(pi);
+
+  const ctxFor = (sessionId) => ({
+    cwd: workDir,
+    sessionManager: { getSessionId: () => sessionId },
+    modelRegistry: { getProvider: (name) => (providers.includes(name) ? { name } : undefined) },
+  });
+
+  const call = async (event, sessionId, payload) => {
+    let result;
+    for (const handler of handlers.get(event) ?? []) {
+      const outcome = await handler(payload, ctxFor(sessionId));
+      if (outcome !== undefined) result = outcome;
+    }
+    return result;
+  };
+
+  return {
+    start: (sessionId, type = messageType) =>
+      call("before_agent_start", sessionId, {
+        messageType: type,
+        systemPromptOptions: { sections: {}, contextFiles: [] },
+      }),
+    toolCall: (sessionId, toolName) => call("tool_call", sessionId, { toolName, input: {} }),
+    toolEnd: (sessionId, toolName, isError = false) =>
+      call("tool_execution_end", sessionId, { toolName, isError, toolCallId: "t" }),
+    cleanup: () => {
+      if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+      rmSync(agentDir, { recursive: true, force: true });
+      rmSync(workDir, { recursive: true, force: true });
+    },
+  };
+}
+
+await runCaseAsync("CASE 29: a user run arms the gate until a spawn, then re-arms after a mutation", async () => {
+  const h = gateHarness();
+  try {
+    await h.start("s-arith");
+
+    const blockedRead = await h.toolCall("s-arith", "read");
+    assert(blockedRead?.block === true, "first read must be blocked");
+    assert(/scout|oracle/.test(blockedRead.reason ?? ""), `reason must name the roles:\n${blockedRead.reason}`);
+
+    assert((await h.toolCall("s-arith", "subagent")) === undefined, "spawning must never be blocked");
+    assert((await h.toolCall("s-arith", "read")) === undefined, "read must pass after a spawn");
+    assert((await h.toolCall("s-arith", "edit")) === undefined, "edit must pass after a spawn");
+
+    await h.toolEnd("s-arith", "subagent");
+    await h.toolEnd("s-arith", "edit");
+    const rearmed = await h.toolCall("s-arith", "write");
+    assert(rearmed?.block === true, "a completed top-level mutation must re-arm the gate");
+  } finally {
+    h.cleanup();
+  }
+});
+
+await runCaseAsync("CASE 30: child sessions and in-flight spawns are never blocked", async () => {
+  const h = gateHarness();
+  try {
+    await h.start("s-parent");
+    await h.start("s-other");
+    assert((await h.toolCall("s-child", "read")) === undefined, "a child session must read freely");
+    assert((await h.toolCall("s-child", "bash")) === undefined, "a child session must run bash freely");
+
+    assert((await h.toolCall("s-other", "read"))?.block === true, "another top-level session must stay gated");
+    await h.toolCall("s-parent", "subagent");
+    assert(
+      (await h.toolCall("s-other", "read")) === undefined,
+      "while a spawn is in flight, tool calls must pass",
+    );
+    await h.toolEnd("s-parent", "subagent");
+    assert((await h.toolCall("s-other", "read"))?.block === true, "after the spawn ends, the gate closes again");
+  } finally {
+    h.cleanup();
+  }
+});
+
+await runCaseAsync("CASE 31: two sessions do not share delegation", async () => {
+  const h = gateHarness();
+  try {
+    await h.start("s-a");
+    await h.start("s-b");
+    await h.toolCall("s-a", "subagent");
+    await h.toolEnd("s-a", "subagent");
+    assert((await h.toolCall("s-a", "read")) === undefined, "the delegating session must be open");
+    assert((await h.toolCall("s-b", "read"))?.block === true, "the other session must stay armed");
+  } finally {
+    h.cleanup();
+  }
+});
+
+await runCaseAsync("CASE 32: a withheld workflow is never enforced", async () => {
+  // No user file, and required extensions missing, so the packaged default is withheld.
+  const h = gateHarness({ packages: [], userFile: null });
+  try {
+    await h.start("s-withheld");
+    assert((await h.toolCall("s-withheld", "read")) === undefined, "nothing to enforce means nothing to block");
+  } finally {
+    h.cleanup();
+  }
+});
+
+await runCaseAsync("CASE 33: a user turn re-arms the session gate", async () => {
+  const h = gateHarness();
+  try {
+    await h.start("s-turn");
+    await h.toolCall("s-turn", "subagent");
+    await h.toolEnd("s-turn", "subagent");
+    assert((await h.toolCall("s-turn", "read")) === undefined, "open after delegation");
+    await h.start("s-turn");
+    assert((await h.toolCall("s-turn", "read"))?.block === true, "a new user turn must re-arm");
+  } finally {
+    h.cleanup();
+  }
 });
 
 if (failures > 0) {

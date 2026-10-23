@@ -1,22 +1,48 @@
 # pi-orchestrator
 
-A pi extension that ships a default agent workflow and injects it into the
-system prompt, so installing the package gives you a working
-plan -> implement -> review loop without writing an AGENTS.md. It injects
-exactly one section, the workflow. The model roster lives in pi-failover,
-which is a required companion and registers `model_roster` itself.
+A pi extension that ships a default agent workflow, injects it into the system
+prompt where an `AGENTS.md` would go, and enforces it by blocking direct file
+work until a subagent has been spawned. Installing the package gives you a
+working plan -> implement -> review loop without writing an AGENTS.md. The
+model roster lives in pi-failover, which is a required companion and registers
+`model_roster` itself.
 
 ## What it does
 
-This package injects one section, the workflow, and never names a specific
-model.
+Two mechanisms. Both are needed, and neither alone was enough.
+
+**Injection.** The winning workflow is added to `systemPromptOptions.contextFiles`,
+which pi renders inside `<project_context>` as
+`<project_instructions path="...">`. That is the same slot, framing, and
+position as `AGENTS.md`, and it carries the same authority. A custom prompt
+section always renders *after* `<cwd>` - last in the prompt, behind the skills
+list - which is the weakest position available and is why the workflow used to
+be readable but ignored.
+
+**Enforcement.** `tool_call` handlers can block a call. Until a `subagent` spawn
+has happened in that session, the gate blocks every file-reading and
+file-mutating tool (`read`, `grep`, `find`, `ls`, `bash`, `powershell`, `edit`,
+`write`, `codemode`, `lsp_*`, `ctx_*`). Reading is gated on purpose: with reads
+open, the model gathers context itself, concludes the files are "already
+known", and the workflow's own "skip scout when files are known" clause
+licenses skipping the delegation.
+
+`subagent` and `ask_user` always pass. Child agent sessions are exempt, because
+pi-subagents runs children as pi sessions inside the same process and gating
+them would deadlock the scout the gate exists to force. Counts are per session
+and per spawn, so a failed or abandoned spawn cannot leave the gate stuck open.
+
+A completed top-level `edit`/`write` re-arms that session: the next change must
+delegate again, which is what keeps implementation on `worker` instead of in the
+orchestrator.
 
 **Workflow.** The packaged default in `assets/ORCHESTRATOR.example.md` is
 injected only when all four required companion extensions are installed;
-otherwise it is withheld. Your own `ORCHESTRATOR.md` in the current
-directory, a parent, or the pi agent dir replaces the default outright and is
-always injected verbatim, never withheld. `/workflow doctor` reports what is
-present and whether the workflow is withheld.
+otherwise it is withheld, and a withheld workflow is never enforced. Your own
+`ORCHESTRATOR.md` in the current directory, a parent, or the pi agent dir
+replaces the default outright and is always injected verbatim, never withheld.
+`/workflow doctor` reports what is present, whether the workflow is withheld,
+and whether the gate is armed.
 
 **Model roster.** This package does not render or inject the model roster.
 pi-failover owns that section: it registers `model_roster` itself, so the
@@ -44,16 +70,22 @@ pi install git:github.com/rthadani/pi-failover
 
 ## Behaviour
 
-The workflow is resolved once and cached. It is re-read only when the winning
-file's mtime changes (or the resolved path changes). If the file is missing,
-unreadable, or empty, the extension injects no workflow and warns once at
+The workflow is resolved once per resolved path and cached. It is re-read only
+when that file's mtime or size changes. If the file is missing, unreadable, or
+empty, the extension injects no workflow, enforces nothing, and warns once at
 load; it never throws into a session.
+
+Enforcement has one switch: `WORKFLOW_ENFORCE=off` (also `0`, `false`, `no`)
+disables the gate for the process while leaving injection intact. There is no
+per-task bypass: the workflow's own triviality test is a judgement the gate
+cannot make, and a bypass command is exactly what gets used to skip the work.
 
 `/workflow` reports which workflow source won (your `ORCHESTRATOR.md` with its
 path, or the packaged default with its mtime); `/workflow init` copies the
-template to a file you own; `/workflow doctor` audits which required
-extensions are installed and whether the workflow is currently withheld or
-injecting. Set `ORCHESTRATOR_DEBUG=1` to log the workflow report at load.
+template to a file you own; `/workflow doctor` audits which required extensions
+are installed, whether the workflow is currently withheld or injecting, and
+whether the gate is armed for this session. Set `ORCHESTRATOR_DEBUG=1` to log
+the workflow report at load.
 
 ## Default workflow
 
@@ -124,6 +156,12 @@ It makes no routing decisions and never contacts a provider. It does not
 render or inject the model roster: that section belongs to pi-failover. Policy
 (which class to pick when, escalation rules, review discipline) lives in your
 `ORCHESTRATOR.md`, or in the packaged default workflow when you have none.
+
+It also does not judge your task. It cannot tell a one-line fix from an
+architecture change, so it enforces the shape of the work (delegate, then do)
+rather than the classification of it. `bash` writes remain a hole: the gate
+blocks `bash` before a spawn, but after one, a spawn-backed shell can still
+write files. If that matters, gate `bash` yourself or run without it.
 
 ## Publishing
 

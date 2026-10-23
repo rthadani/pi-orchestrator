@@ -1,15 +1,42 @@
 {
   "name": "@rthadani/pi-orchestrator",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": false,
-  "description": "A pi extension that ships a default agent workflow and injects it into the system prompt.",
-  "keywords": ["pi-package", "pi", "orchestrator", "workflow", "subagents", "failover", "models", "roster", "prompt"],
-  "publishConfig": { "access": "public" },
+  "description": "A pi extension that ships a default agent workflow, injects it where an AGENTS.md goes, and enforces delegation before direct file work.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "orchestrator",
+    "workflow",
+    "subagents",
+    "failover",
+    "models",
+    "roster",
+    "prompt"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "MIT",
   "author": "Rohit Thadani <rohit.thadani@gmail.com>",
-  "repository": { "type": "git", "url": "git+ssh://git@github.com/rthadani/pi-orchestrator.git" },
-  "bugs": { "url": "https://github.com/rthadani/pi-orchestrator/issues" },
-  "files": ["extensions", "assets", "README.md"],
-  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
-  "pi": { "extensions": ["./extensions/pi-orchestrator.ts"] }
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/rthadani/pi-orchestrator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rthadani/pi-orchestrator/issues"
+  },
+  "files": [
+    "extensions",
+    "assets",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-orchestrator.ts"
+    ]
+  }
 }

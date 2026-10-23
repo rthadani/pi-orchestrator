@@ -1,18 +1,35 @@
 /**
- * pi-orchestrator: inject the workflow section into the system prompt.
+ * pi-orchestrator: make the workflow authoritative, not advisory.
+ *
+ * Two mechanisms, both required:
+ *
+ * 1. Injection. The winning workflow is added to `systemPromptOptions.contextFiles`,
+ *    which pi renders inside `<project_context>` as
+ *    `<project_instructions path="...">` - the same slot and framing as an
+ *    AGENTS.md. A custom prompt section always renders after `<cwd>`, i.e. last,
+ *    which is the weakest position in the prompt; the project-instructions slot
+ *    is early and carries repo-configuration authority. The legacy
+ *    `orchestrator_workflow` section is deleted on sight so a prompt never
+ *    carries the workflow twice.
+ *
+ * 2. Enforcement. `tool_call` can block a call (`return { block: true }`). The
+ *    gate blocks every file-reading or file-mutating tool until a `subagent`
+ *    spawn has happened in that session. Without it, the model reads the repo
+ *    itself, decides the files are "already known", and your own step-1 clause
+ *    licenses skipping scout and oracle.
+ *
+ * State is keyed by session id, never by module-level "current task", so two
+ * sessions in one process cannot borrow each other's delegation. Child agent
+ * sessions are exempt: pi-subagents runs children as pi sessions in this
+ * process, so a gate that ignored them would deadlock the scout it is meant to
+ * force.
  *
  * The workflow file names capability classes (opus, sonnet, flash, coding)
- * rather than models; pi-failover owns and injects the model roster section,
- * which lists which models each class contains. A user's own ORCHESTRATOR.md
- * (found in cwd, any parent directory, or the agent dir, nearest first)
- * replaces the packaged default outright; the two are never injected together.
- * pi loads its own context files separately, so those do not suppress this
- * workflow. The packaged workflow is injected only when all four required
- * companion extensions are installed; a missing one withholds it. Installation
- * is read from pi's settings packages plus the model registry's `failover`
- * provider, not from runtime tool visibility. /workflow doctor reports what is
- * installed and whether the workflow is withheld. A user's own ORCHESTRATOR.md
- * is always injected verbatim, never withheld.
+ * rather than models; pi-failover owns and injects the model roster section.
+ * A user's own ORCHESTRATOR.md (cwd, any parent, or the agent dir, nearest
+ * first) replaces the packaged default outright. The packaged workflow is
+ * injected only when all four required companion extensions are installed; a
+ * missing one withholds it, and a withheld workflow is never enforced.
  *
  * Warning: a class name is not a model string. Pass `failover/<model-name>`;
  * `failover/<class>` does not resolve to that class and falls back to the
@@ -33,6 +50,14 @@ function mtimeOf(path: string): number | null {
   }
 }
 
+function sizeOf(path: string): number | null {
+  try {
+    return statSync(path).size;
+  } catch {
+    return null;
+  }
+}
+
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -42,7 +67,7 @@ function agentDir(): string {
 }
 
 /** Directories searched for ORCHESTRATOR.md: cwd up to the root, then the agent dir. */
-function candidateDirs(cwd: string, agentDir: string): string[] {
+function candidateDirs(cwd: string, agentDirPath: string): string[] {
   const dirs: string[] = [];
   const seen = new Set<string>();
   const addDir = (dir: string): void => {
@@ -59,7 +84,7 @@ function candidateDirs(cwd: string, agentDir: string): string[] {
     if (parent === current) break;
     current = parent;
   }
-  addDir(agentDir);
+  addDir(agentDirPath);
   return dirs;
 }
 
@@ -70,10 +95,10 @@ function candidateDirs(cwd: string, agentDir: string): string[] {
  */
 export function findOrchestratorFile(
   cwd: string,
-  agentDir: string,
+  agentDirPath: string,
   exists: (p: string) => boolean,
 ): string | undefined {
-  for (const dir of candidateDirs(cwd, agentDir)) {
+  for (const dir of candidateDirs(cwd, agentDirPath)) {
     const path = join(dir, "ORCHESTRATOR.md");
     if (exists(path)) return path;
   }
@@ -81,7 +106,7 @@ export function findOrchestratorFile(
 }
 
 export interface WorkflowState {
-  /** The workflow section to inject, or "" when no workflow was loaded. */
+  /** The workflow text to inject, or "" when no workflow was loaded. */
   section: string;
   /** The resolved file path (user file or packaged asset). */
   path: string;
@@ -120,30 +145,212 @@ function buildWorkflow(path: string, source: "user" | "default"): WorkflowState 
   return { section: raw, path, mtimeMs, disabled: null, source };
 }
 
-let workflowCache: WorkflowState | null = null;
-
 /**
- * Resolve the winning workflow: the user's ORCHESTRATOR.md when one exists,
- * otherwise the packaged default. Cached by resolved path + mtime, so user and
- * default files are only re-read when they change. Never throws; a missing or
- * unreadable file yields an empty section with a `disabled` reason.
+ * One cache slot per resolved path, not one slot for the process. Two sessions
+ * with different working directories would otherwise evict each other on every
+ * run, which is a correctness problem (a stale slot could serve the wrong
+ * workflow for a moment) as well as a performance one.
  */
-export function loadWorkflow(cwd?: string, agentDirPath?: string): WorkflowState {
-  const resolvedCwd = cwd ?? process.cwd();
-  const resolvedAgentDir = agentDirPath ?? agentDir();
-  const userPath = findOrchestratorFile(resolvedCwd, resolvedAgentDir, existsSync);
-  const path = userPath ?? workflowAssetPath();
-  const source: "user" | "default" = userPath ? "user" : "default";
-  if (workflowCache && workflowCache.path === path && workflowCache.mtimeMs === mtimeOf(path)) {
-    return workflowCache;
+const workflowCache = new Map<string, { mtimeMs: number | null; size: number | null; state: WorkflowState }>();
+
+function loadWorkflowFrom(path: string, source: "user" | "default"): WorkflowState {
+  const mtimeMs = mtimeOf(path);
+  const size = sizeOf(path);
+  const cached = workflowCache.get(path);
+  if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+    return cached.state;
   }
-  workflowCache = buildWorkflow(path, source);
-  return workflowCache;
+  const state = buildWorkflow(path, source);
+  workflowCache.set(path, { mtimeMs, size, state });
+  return state;
 }
 
-function workflowReport(): string {
-  const workflow = loadWorkflow();
+/** Resolve the winning workflow: the user's ORCHESTRATOR.md, else the packaged default. */
+export function loadWorkflow(cwd?: string, agentDirPath?: string): WorkflowState {
+  const resolvedCwd = cwd ?? process.cwd();
+  const userPath = findOrchestratorFile(resolvedCwd, agentDirPath ?? agentDir(), existsSync);
+  return loadWorkflowFrom(userPath ?? workflowAssetPath(), userPath ? "user" : "default");
+}
 
+/** The section key older versions used. It is removed wherever it is found. */
+const LEGACY_SECTION_KEY = "orchestrator_workflow";
+
+interface MutablePromptOptions {
+  contextFiles?: Array<{ path: string; content: string }>;
+  sections?: Record<string, string>;
+}
+
+/**
+ * Put the workflow where an AGENTS.md would go, and nowhere else.
+ *
+ * Idempotent by construction: every existing entry for the workflow path is
+ * dropped first, so running this twice (or on options reused across runs)
+ * cannot accumulate copies.
+ */
+export function applyWorkflowToPrompt(
+  options: MutablePromptOptions,
+  workflow: WorkflowState,
+  active: boolean,
+): void {
+  const files = options.contextFiles ?? (options.contextFiles = []);
+  for (let index = files.length - 1; index >= 0; index -= 1) {
+    if (files[index].path === workflow.path) files.splice(index, 1);
+  }
+  if (active && workflow.section) {
+    files.push({ path: workflow.path, content: workflow.section });
+  }
+  if (options.sections) delete options.sections[LEGACY_SECTION_KEY];
+}
+
+/**
+ * Tools that can read or write repository state. Blocking reads is deliberate:
+ * with reads open, the model gathers the context itself, then reasons that the
+ * files are "already known" and skips the recon the workflow asks for.
+ */
+const GATED_TOOL = /^(read|grep|find|ls|bash|powershell|edit|write|codemode|lsp_|ctx_)/;
+
+/** Tools that must always pass: spawning is the way out of the gate. */
+const ALWAYS_ALLOWED = new Set(["subagent", "ask_user"]);
+
+function isMutatingTool(toolName: string): boolean {
+  return /^(edit|write)$/.test(toolName) || /^(bash|powershell|codemode)$/.test(toolName);
+}
+
+export interface GateInput {
+  toolName: string;
+  /** The workflow is injected for this session, so it can be enforced. */
+  active: boolean;
+  /** `WORKFLOW_ENFORCE=off` and similar. */
+  enforce: boolean;
+  /** This call belongs to a top-level (user-started) session. */
+  topLevel: boolean;
+  /** A spawn is in flight, so child sessions are calling tools right now. */
+  spawnInFlight: boolean;
+  /** A `subagent` spawn has already happened in this session. */
+  delegated: boolean;
+}
+
+export interface GateDecision {
+  block: boolean;
+  reason?: string;
+}
+
+/** Pure gate decision, so the enforcement rules are testable without pi. */
+export function decideToolGate(input: GateInput): GateDecision {
+  if (!input.enforce || !input.active) return { block: false };
+  if (ALWAYS_ALLOWED.has(input.toolName)) return { block: false };
+  if (!GATED_TOOL.test(input.toolName)) return { block: false };
+  // Children run as pi sessions in this process; gating them would deadlock scout.
+  if (!input.topLevel || input.spawnInFlight) return { block: false };
+  if (input.delegated) return { block: false };
+
+  const what = isMutatingTool(input.toolName) ? "change files" : "inspect the repository";
+  return {
+    block: true,
+    reason: [
+      `Blocked: ${input.toolName} cannot be used to ${what} yet.`,
+      "The active workflow requires delegation before direct work:",
+      'recon with subagent({ agent: "scout", task: "..." }), design with',
+      'subagent({ agent: "oracle", task: "..." }), then implement with',
+      'subagent({ agent: "worker", task: "..." }). Start with scout or oracle.',
+    ].join(" "),
+  };
+}
+
+/** Enforcement is on unless explicitly disabled for the process. */
+export function enforcementEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const value = (env.WORKFLOW_ENFORCE ?? "").trim().toLowerCase();
+  return !(value === "off" || value === "0" || value === "false" || value === "no");
+}
+
+/**
+ * Per-session gate bookkeeping. All mutation happens on the event loop, one
+ * event at a time, so no locking is needed; the invariant that matters is that
+ * no state is keyed by "the current task" or by module-level single slots.
+ */
+class WorkflowGate {
+  private readonly topLevelSessions = new Set<string>();
+  private readonly activeSessions = new Set<string>();
+  private readonly delegatedSessions = new Set<string>();
+  private spawnsInFlight = 0;
+
+  /** A user-started run defines a top-level session and re-arms its gate. */
+  beginUserRun(session: string): void {
+    this.topLevelSessions.add(session);
+    this.delegatedSessions.delete(session);
+    // Any spawn still counted here belongs to an earlier turn that never
+    // reported completion; a user turn is a safe point to drop the count.
+    this.spawnsInFlight = 0;
+  }
+
+  setActive(session: string, active: boolean): void {
+    if (active) this.activeSessions.add(session);
+    else this.activeSessions.delete(session);
+  }
+
+  isTopLevel(session: string): boolean {
+    return this.topLevelSessions.has(session);
+  }
+
+  /** A spawn started: the whole session is now allowed to work directly. */
+  spawnStarted(session: string): void {
+    this.delegatedSessions.add(session);
+    this.spawnsInFlight += 1;
+  }
+
+  /** A spawn finished, successfully or not: never leave the count stuck. */
+  spawnEnded(): void {
+    this.spawnsInFlight = Math.max(0, this.spawnsInFlight - 1);
+  }
+
+  /** A top-level edit/write completed, so the next change must re-delegate. */
+  mutationCompleted(session: string): void {
+    this.delegatedSessions.delete(session);
+  }
+
+  /** Current decision for a tool call in a session. */
+  decide(
+    session: string,
+    toolName: string,
+    enforce: boolean,
+  ): GateDecision {
+    return decideToolGate({
+      toolName,
+      active: this.activeSessions.has(session),
+      enforce,
+      topLevel: this.topLevelSessions.has(session),
+      spawnInFlight: this.spawnsInFlight > 0,
+      delegated: this.delegatedSessions.has(session),
+    });
+  }
+
+  describe(session: string): string {
+    if (!this.activeSessions.has(session)) return "enforcement: inactive (no workflow injected)";
+    if (!this.topLevelSessions.has(session)) return "enforcement: child session (exempt)";
+    if (this.delegatedSessions.has(session)) return "enforcement: delegation seen, tools open";
+    return "enforcement: armed, file tools blocked until a spawn";
+  }
+}
+
+/** Best-effort session identity; never throws for a minimal ctx. */
+function sessionKey(ctx: unknown): string {
+  const manager = (ctx as { sessionManager?: { getSessionId?: () => string } } | undefined)?.sessionManager;
+  try {
+    const id = manager?.getSessionId?.();
+    if (typeof id === "string" && id.length > 0) return id;
+  } catch {
+    // fall through
+  }
+  const cwd = (ctx as { cwd?: string } | undefined)?.cwd;
+  return typeof cwd === "string" ? `cwd:${cwd}` : "session:default";
+}
+
+function cwdOf(ctx: unknown): string {
+  const cwd = (ctx as { cwd?: string } | undefined)?.cwd;
+  return typeof cwd === "string" && cwd.length > 0 ? cwd : process.cwd();
+}
+
+function workflowReport(workflow: WorkflowState): string {
   const lines: string[] = [];
   if (workflow.source === "user") {
     lines.push("workflow source: user file");
@@ -167,8 +374,10 @@ if (initialWorkflow.disabled) {
   console.warn(`[pi-orchestrator] workflow disabled: ${initialWorkflow.disabled}`);
 }
 if (process.env.ORCHESTRATOR_DEBUG) {
-  console.log(`[pi-orchestrator]\n${workflowReport()}`);
+  console.log(`[pi-orchestrator]\n${workflowReport(initialWorkflow)}`);
 }
+
+const gate = new WorkflowGate();
 
 interface CapabilityDef {
   capability: string;
@@ -354,6 +563,8 @@ export interface DoctorState {
   withheld: boolean;
   /** Runtime tool names seen via pi.getAllTools(); informational, never a gate. */
   toolsSeen: ReadonlySet<string> | null;
+  /** Gate state for the calling session, when one is known. */
+  enforcement?: string;
 }
 
 /** Render the /workflow doctor report; pure so it can be exercised offline. */
@@ -361,11 +572,11 @@ export function renderDoctorReport(state: DoctorState): string {
   const lines: string[] = ["workflow extensions"];
   const required = CAPABILITY_DEFS.filter((def) => def.required);
   const optional = CAPABILITY_DEFS.filter((def) => !def.required);
-  const missingRequired = required.filter((def) => !state.available.has(def.capability));
+  const missingRequiredDefs = required.filter((def) => !state.available.has(def.capability));
 
-  if (missingRequired.length > 0) {
+  if (missingRequiredDefs.length > 0) {
     lines.push(
-      `MISSING REQUIRED: ${missingRequired
+      `MISSING REQUIRED: ${missingRequiredDefs
         .map((def) => def.capability)
         .join(", ")} — the workflow expects ${required.map((def) => def.capability).join(", ")}`,
     );
@@ -400,7 +611,10 @@ export function renderDoctorReport(state: DoctorState): string {
   } else {
     lines.push("workflow status: injecting (packaged default; all required extensions installed)");
   }
+  lines.push(`workflow placement: <project_instructions path="${state.workflowPath}"> inside <project_context>`);
+  if (state.enforcement) lines.push(state.enforcement);
   lines.push("");
+
   const toolsSeen = state.toolsSeen;
   if (toolsSeen !== null) {
     lines.push("runtime tools (informational, not a gate):");
@@ -418,19 +632,29 @@ export function renderDoctorReport(state: DoctorState): string {
 
 export default function piRoster(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event, ctx) => {
-    const workflowState = loadWorkflow();
+    const session = sessionKey(ctx);
+    // `messageType` is "user" for a prompt or pi.sendUserMessage(), "custom" for
+    // pi.sendMessage(..., { triggerTurn: true }) - which is how subagent
+    // children start, so children are never treated as top-level.
+    const messageType = (event as { messageType?: string }).messageType;
+    if (messageType === undefined || messageType === "user") {
+      gate.beginUserRun(session);
+    }
+
+    const workflowState = loadWorkflow(cwdOf(ctx));
 
     const present = detectPresent(ctx);
     const missing = present === null ? null : missingRequired(present);
     // Fail open when detection is unavailable; a user's own file is never withheld.
     const withhold = missing !== null && missing.length > 0 && workflowState.source !== "user";
 
-    const workflowSection = workflowState.section && !withhold ? workflowState.section : "";
-    if (workflowSection) {
-      event.systemPromptOptions.sections.orchestrator_workflow = workflowSection;
-    } else {
-      delete event.systemPromptOptions.sections.orchestrator_workflow;
-    }
+    const active = Boolean(workflowState.section) && !withhold;
+    applyWorkflowToPrompt(
+      event.systemPromptOptions as unknown as MutablePromptOptions,
+      workflowState,
+      active,
+    );
+    gate.setActive(session, active);
 
     if (missing === null) {
       warnEnforcementUnverified();
@@ -439,10 +663,43 @@ export default function piRoster(pi: ExtensionAPI): void {
     }
   });
 
+  // Enforce: until a spawn happens, file tools are blocked for a top-level
+  // session. `tool_call` can block; a handler failure also blocks (fail-closed).
+  pi.on("tool_call", (event, ctx) => {
+    const session = sessionKey(ctx);
+    const toolName = (event as { toolName?: string }).toolName ?? "";
+    const decision = gate.decide(session, toolName, enforcementEnabled());
+
+    if (toolName === "subagent") {
+      // Mark before deciding: spawning is always allowed, and it opens the gate.
+      gate.spawnStarted(session);
+      return;
+    }
+    if (decision.block) {
+      return { block: true, reason: decision.reason ?? "blocked by pi-orchestrator" };
+    }
+  });
+
+  // Pair the spawn counter so a failed or aborted spawn cannot leave the gate
+  // permanently open, and re-arm after a top-level mutation.
+  pi.on("tool_execution_end", (event, ctx) => {
+    const toolName = (event as { toolName?: string }).toolName ?? "";
+    const session = sessionKey(ctx);
+    if (toolName === "subagent") {
+      gate.spawnEnded();
+      return;
+    }
+    if (gate.isTopLevel(session) && isMutatingTool(toolName)) {
+      const isError = Boolean((event as { isError?: boolean }).isError);
+      if (!isError) gate.mutationCompleted(session);
+    }
+  });
+
   pi.registerCommand("workflow", {
-    description: "Show workflow source; `init` copies the template; `doctor` audits required extensions",
+    description: "Show workflow source and enforcement state; `init` copies the template; `doctor` audits it",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
+      const session = sessionKey(ctx);
       if (tokens[0] === "doctor") {
         const present = detectPresent(ctx);
         if (present === null) {
@@ -452,7 +709,7 @@ export default function piRoster(pi: ExtensionAPI): void {
           );
           return;
         }
-        const workflow = loadWorkflow();
+        const workflow = loadWorkflow(cwdOf(ctx));
         const missing = missingRequired(present);
         const withheld = missing.length > 0 && workflow.source !== "user";
         ctx.ui.notify(
@@ -462,6 +719,7 @@ export default function piRoster(pi: ExtensionAPI): void {
             workflowPath: workflow.path,
             withheld,
             toolsSeen: collectToolNames(pi),
+            enforcement: gate.describe(session),
           }),
           "info",
         );
@@ -469,8 +727,8 @@ export default function piRoster(pi: ExtensionAPI): void {
       }
       if (tokens[0] === "init") {
         const target = tokens[1]
-          ? resolve(ctx.cwd, tokens.slice(1).join(" "))
-          : resolve(ctx.cwd, "ORCHESTRATOR.md");
+          ? resolve(cwdOf(ctx), tokens.slice(1).join(" "))
+          : resolve(cwdOf(ctx), "ORCHESTRATOR.md");
         if (existsSync(target)) {
           ctx.ui.notify(
             `refusing to overwrite existing file: ${target}\nEdit it directly, or run /workflow init with another path.`,
@@ -489,7 +747,7 @@ export default function piRoster(pi: ExtensionAPI): void {
         }
         return;
       }
-      ctx.ui.notify(workflowReport(), "info");
+      ctx.ui.notify(workflowReport(loadWorkflow(cwdOf(ctx))), "info");
     },
   });
 }
