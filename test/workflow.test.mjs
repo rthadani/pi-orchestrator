@@ -649,7 +649,7 @@ runCase("CASE 24: before_agent_start never sets and never deletes model_roster",
 
 // Drive the real handlers through a fake pi: before_agent_start, then a
 // sequence of tool_call / tool_execution_end events for named sessions.
-function gateHarness({ userFile = "# workflow\ndelegate first\n", packages = null, providers = ["failover"], messageType = "user" } = {}) {
+function gateHarness({ userFile = "# workflow\ndelegate first\n", packages = null, providers = ["failover"], messageType = "user", tools = ["subagent", "read", "grep", "bash", "edit", "write"] } = {}) {
   const agentDir = mkdtempSync(join(tmpdir(), "pi-orch-gate-"));
   const workDir = mkdtempSync(join(tmpdir(), "pi-orch-gatew-"));
   if (userFile !== null) writeFileSync(join(workDir, "ORCHESTRATOR.md"), userFile);
@@ -667,6 +667,7 @@ function gateHarness({ userFile = "# workflow\ndelegate first\n", packages = nul
       list.push(cb);
       handlers.set(event, list);
     },
+    getAllTools: () => tools.map((name) => ({ name })),
     registerCommand() {},
   };
   piRoster(pi);
@@ -781,6 +782,28 @@ await runCaseAsync("CASE 33: a user turn re-arms the session gate", async () => 
     assert((await h.toolCall("s-turn", "read")) === undefined, "open after delegation");
     await h.start("s-turn");
     assert((await h.toolCall("s-turn", "read"))?.block === true, "a new user turn must re-arm");
+  } finally {
+    h.cleanup();
+  }
+});
+
+await runCaseAsync("CASE 34: a process without the subagent tool is never gated", async () => {
+  // This is the review-child case: no way to spawn, so blocking a read would wedge it.
+  const h = gateHarness({ tools: ["read", "grep", "bash"] });
+  try {
+    await h.start("s-reviewer");
+    assert((await h.toolCall("s-reviewer", "read")) === undefined, "a session that cannot delegate must not be blocked");
+    assert((await h.toolCall("s-reviewer", "bash")) === undefined, "nor may its shell be blocked");
+  } finally {
+    h.cleanup();
+  }
+});
+
+await runCaseAsync("CASE 35: an unknown run type never arms the gate", async () => {
+  const h = gateHarness();
+  try {
+    await h.start("s-nomt", "other");
+    assert((await h.toolCall("s-nomt", "read")) === undefined, "only an explicit user run may arm the gate");
   } finally {
     h.cleanup();
   }

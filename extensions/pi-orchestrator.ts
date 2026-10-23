@@ -19,10 +19,11 @@
  *    licenses skipping scout and oracle.
  *
  * State is keyed by session id, never by module-level "current task", so two
- * sessions in one process cannot borrow each other's delegation. Child agent
- * sessions are exempt: pi-subagents runs children as pi sessions in this
- * process, so a gate that ignored them would deadlock the scout it is meant to
- * force.
+ * sessions in one process cannot borrow each other's delegation. Enforcement
+ * only happens in a session that can actually delegate: children are exempt
+ * (they start from a custom message), and a process without the `subagent`
+ * tool is exempt too, so a review child can never be wedged between a gate it
+ * cannot satisfy and a read it is not allowed to make.
  *
  * The workflow file names capability classes (opus, sonnet, flash, coding)
  * rather than models; pi-failover owns and injects the model roster section.
@@ -440,8 +441,7 @@ export function missingRequired(available: ReadonlySet<string>): CapabilityDef[]
   return CAPABILITY_DEFS.filter((def) => def.required && !available.has(def.capability));
 }
 
-/** Best-effort tool names from pi; null when getAllTools is absent or throws. Informational only. */
-function collectToolNames(pi: ExtensionAPI): ReadonlySet<string> | null {
+/** Best-effort tool names from pi; null when getAllTools is absent or throws. Informational only. */function collectToolNames(pi: ExtensionAPI): ReadonlySet<string> | null {
   try {
     const getAll = (pi as unknown as { getAllTools?: () => unknown }).getAllTools;
     if (typeof getAll !== "function") return null;
@@ -456,6 +456,20 @@ function collectToolNames(pi: ExtensionAPI): ReadonlySet<string> | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Whether this process can delegate at all.
+ *
+ * A session without the `subagent` tool has no way to satisfy the gate, so
+ * enforcing there is a deadlock, not a nudge: a review child that cannot spawn
+ * and cannot read is wedged. Unknown capability (no getAllTools) also fails
+ * open, because a wrong "can delegate" answer costs a stuck run while a wrong
+ * "cannot delegate" answer only costs enforcement.
+ */
+function delegationAvailable(pi: ExtensionAPI): boolean {
+  const tools = collectToolNames(pi);
+  return tools !== null && tools.has("subagent");
 }
 
 /** pi's settings.json path, honouring PI_CODING_AGENT_DIR when set. */
@@ -633,11 +647,11 @@ export function renderDoctorReport(state: DoctorState): string {
 export default function piRoster(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event, ctx) => {
     const session = sessionKey(ctx);
-    // `messageType` is "user" for a prompt or pi.sendUserMessage(), "custom" for
-    // pi.sendMessage(..., { triggerTurn: true }) - which is how subagent
-    // children start, so children are never treated as top-level.
+    // Only an explicit user-initiated run defines a top-level session. Children
+    // start from a custom message; an unknown type fails open rather than
+    // arming a gate the session may not be able to satisfy.
     const messageType = (event as { messageType?: string }).messageType;
-    if (messageType === undefined || messageType === "user") {
+    if (messageType === "user") {
       gate.beginUserRun(session);
     }
 
@@ -668,13 +682,17 @@ export default function piRoster(pi: ExtensionAPI): void {
   pi.on("tool_call", (event, ctx) => {
     const session = sessionKey(ctx);
     const toolName = (event as { toolName?: string }).toolName ?? "";
-    const decision = gate.decide(session, toolName, enforcementEnabled());
 
     if (toolName === "subagent") {
       // Mark before deciding: spawning is always allowed, and it opens the gate.
       gate.spawnStarted(session);
       return;
     }
+
+    // No subagent tool in this process means the gate is unsatisfiable here.
+    if (!delegationAvailable(pi)) return;
+
+    const decision = gate.decide(session, toolName, enforcementEnabled());
     if (decision.block) {
       return { block: true, reason: decision.reason ?? "blocked by pi-orchestrator" };
     }
