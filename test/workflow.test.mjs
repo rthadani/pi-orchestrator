@@ -4,7 +4,7 @@
 // failure; prints PASS lines.
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -44,6 +44,8 @@ const {
   applyWorkflowToPrompt,
   decideToolGate,
   enforcementEnabled,
+  isReadOnlyCommand,
+  isSourcePath,
   default: piRoster,
 } = await import("../extensions/pi-orchestrator.ts");
 
@@ -569,18 +571,27 @@ runCase("CASE 23c: injection is idempotent across repeated runs", () => {
   assert(options.contextFiles.length === 0, "a withheld workflow must remove its entry");
 });
 
-runCase("CASE 25: the gate blocks reads and writes for a top-level session with no spawn", () => {
-  for (const toolName of ["read", "grep", "find", "ls", "bash", "edit", "write", "codemode", "lsp_hover", "ctx_execute"]) {
-    const decision = decideToolGate({
-      toolName,
-      active: true,
-      enforce: true,
-      topLevel: true,
-      spawnInFlight: false,
-      delegated: false,
-    });
-    assert(decision.block, `${toolName} should be blocked before a spawn`);
-    assert(/delegation/i.test(decision.reason ?? ""), `${toolName} block reason must explain delegation`);
+runCase("CASE 25: a code write is blocked before a spawn; inspection never is", () => {
+  const base = { active: true, enforce: true, topLevel: true, spawnInFlight: false, delegated: false };
+  for (const call of [
+    { toolName: "edit", input: { path: "src/index.ts" } },
+    { toolName: "write", input: { path: "lib/util.js" } },
+    { toolName: "bash", input: { command: "git commit -m x" } },
+  ]) {
+    const decision = decideToolGate({ ...base, ...call });
+    assert(decision.block, `${call.toolName} ${JSON.stringify(call.input)} should be blocked`);
+    assert(/delegation/i.test(decision.reason ?? ""), `${call.toolName} block reason must explain delegation`);
+    assert(/scout|oracle/.test(decision.reason ?? ""), `${call.toolName} block reason must name the roles`);
+  }
+  for (const call of [
+    { toolName: "read", input: { path: "src/index.ts" } },
+    { toolName: "grep", input: { pattern: "x" } },
+    { toolName: "find", input: {} },
+    { toolName: "ls", input: {} },
+    { toolName: "lsp_hover", input: {} },
+    { toolName: "bash", input: { command: "git status" } },
+  ]) {
+    assert(!decideToolGate({ ...base, ...call }).block, `${call.toolName} must not be blocked`);
   }
 });
 
@@ -687,15 +698,28 @@ function gateHarness({ userFile = "# workflow\ndelegate first\n", packages = nul
     return result;
   };
 
+  // Pair a call's id with its `tool_execution_end`, exactly as pi does.
+  let callSeq = 0;
+  const lastCallId = new Map();
+  const toolCall = async (sessionId, toolName, input = {}) => {
+    const toolCallId = `call-${++callSeq}`;
+    lastCallId.set(`${sessionId}:${toolName}`, toolCallId);
+    return call("tool_call", sessionId, { toolName, input, toolCallId });
+  };
+
   return {
     start: (sessionId, type = messageType) =>
       call("before_agent_start", sessionId, {
         messageType: type,
         systemPromptOptions: { sections: {}, contextFiles: [] },
       }),
-    toolCall: (sessionId, toolName, input = {}) => call("tool_call", sessionId, { toolName, input }),
+    toolCall,
     toolEnd: (sessionId, toolName, isError = false) =>
-      call("tool_execution_end", sessionId, { toolName, isError, toolCallId: "t" }),
+      call("tool_execution_end", sessionId, {
+        toolName,
+        isError,
+        toolCallId: lastCallId.get(`${sessionId}:${toolName}`) ?? "unpaired",
+      }),
     cleanup: () => {
       if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
@@ -705,23 +729,24 @@ function gateHarness({ userFile = "# workflow\ndelegate first\n", packages = nul
   };
 }
 
-await runCaseAsync("CASE 29: a user run arms the gate until a spawn, then re-arms after a mutation", async () => {
+await runCaseAsync("CASE 29: a user run arms the gate until a spawn, then re-arms after a code write", async () => {
   const h = gateHarness();
+  const codeWrite = { path: "src/index.ts" };
   try {
     await h.start("s-arith");
 
-    const blockedRead = await h.toolCall("s-arith", "read");
-    assert(blockedRead?.block === true, "first read must be blocked");
-    assert(/scout|oracle/.test(blockedRead.reason ?? ""), `reason must name the roles:\n${blockedRead.reason}`);
+    const blockedWrite = await h.toolCall("s-arith", "edit", codeWrite);
+    assert(blockedWrite?.block === true, "first source edit must be blocked");
+    assert(/scout|oracle/.test(blockedWrite.reason ?? ""), `reason must name the roles:\n${blockedWrite.reason}`);
+    assert((await h.toolCall("s-arith", "read", { path: "src/index.ts" })) === undefined, "reads are never blocked");
 
     assert((await h.toolCall("s-arith", "subagent")) === undefined, "spawning must never be blocked");
-    assert((await h.toolCall("s-arith", "read")) === undefined, "read must pass after a spawn");
-    assert((await h.toolCall("s-arith", "edit")) === undefined, "edit must pass after a spawn");
+    assert((await h.toolCall("s-arith", "edit", codeWrite)) === undefined, "edit must pass after a spawn");
 
     await h.toolEnd("s-arith", "subagent");
     await h.toolEnd("s-arith", "edit");
-    const rearmed = await h.toolCall("s-arith", "write");
-    assert(rearmed?.block === true, "a completed top-level mutation must re-arm the gate");
+    const rearmed = await h.toolCall("s-arith", "write", { path: "lib/x.ts" });
+    assert(rearmed?.block === true, "a completed code write must re-arm the gate");
   } finally {
     h.cleanup();
   }
@@ -729,20 +754,27 @@ await runCaseAsync("CASE 29: a user run arms the gate until a spawn, then re-arm
 
 await runCaseAsync("CASE 30: child sessions and in-flight spawns are never blocked", async () => {
   const h = gateHarness();
+  const codeWrite = { path: "src/index.ts" };
   try {
     await h.start("s-parent");
     await h.start("s-other");
-    assert((await h.toolCall("s-child", "read")) === undefined, "a child session must read freely");
-    assert((await h.toolCall("s-child", "bash")) === undefined, "a child session must run bash freely");
+    assert((await h.toolCall("s-child", "edit", codeWrite)) === undefined, "a child session must edit freely");
+    assert((await h.toolCall("s-child", "bash", { command: "git commit -m x" })) === undefined, "a child session must run bash freely");
 
-    assert((await h.toolCall("s-other", "read"))?.block === true, "another top-level session must stay gated");
+    assert(
+      (await h.toolCall("s-other", "edit", codeWrite))?.block === true,
+      "another top-level session must stay gated",
+    );
     await h.toolCall("s-parent", "subagent");
     assert(
-      (await h.toolCall("s-other", "read")) === undefined,
-      "while a spawn is in flight, tool calls must pass",
+      (await h.toolCall("s-other", "edit", codeWrite)) === undefined,
+      "while a spawn is in flight, code writes must pass",
     );
     await h.toolEnd("s-parent", "subagent");
-    assert((await h.toolCall("s-other", "read"))?.block === true, "after the spawn ends, the gate closes again");
+    assert(
+      (await h.toolCall("s-other", "edit", codeWrite))?.block === true,
+      "after the spawn ends, the gate closes again",
+    );
   } finally {
     h.cleanup();
   }
@@ -750,13 +782,14 @@ await runCaseAsync("CASE 30: child sessions and in-flight spawns are never block
 
 await runCaseAsync("CASE 31: two sessions do not share delegation", async () => {
   const h = gateHarness();
+  const codeWrite = { path: "src/index.ts" };
   try {
     await h.start("s-a");
     await h.start("s-b");
     await h.toolCall("s-a", "subagent");
     await h.toolEnd("s-a", "subagent");
-    assert((await h.toolCall("s-a", "read")) === undefined, "the delegating session must be open");
-    assert((await h.toolCall("s-b", "read"))?.block === true, "the other session must stay armed");
+    assert((await h.toolCall("s-a", "edit", codeWrite)) === undefined, "the delegating session must be open");
+    assert((await h.toolCall("s-b", "edit", codeWrite))?.block === true, "the other session must stay armed");
   } finally {
     h.cleanup();
   }
@@ -775,20 +808,21 @@ await runCaseAsync("CASE 32: a withheld workflow is never enforced", async () =>
 
 await runCaseAsync("CASE 33: a user turn re-arms the session gate", async () => {
   const h = gateHarness();
+  const codeWrite = { path: "src/index.ts" };
   try {
     await h.start("s-turn");
     await h.toolCall("s-turn", "subagent");
     await h.toolEnd("s-turn", "subagent");
-    assert((await h.toolCall("s-turn", "read")) === undefined, "open after delegation");
+    assert((await h.toolCall("s-turn", "edit", codeWrite)) === undefined, "open after delegation");
     await h.start("s-turn");
-    assert((await h.toolCall("s-turn", "read"))?.block === true, "a new user turn must re-arm");
+    assert((await h.toolCall("s-turn", "edit", codeWrite))?.block === true, "a new user turn must re-arm");
   } finally {
     h.cleanup();
   }
 });
 
 await runCaseAsync("CASE 34: a process without the subagent tool is never gated", async () => {
-  // This is the review-child case: no way to spawn, so blocking a read would wedge it.
+  // This is the review-child case: no way to spawn, so blocking a write would wedge it.
   const h = gateHarness({ tools: ["read", "grep", "bash"] });
   try {
     await h.start("s-reviewer");
@@ -811,25 +845,137 @@ await runCaseAsync("CASE 35: an unknown run type never arms the gate", async () 
 
 await runCaseAsync("CASE 36: a subagent management action does not open the gate", async () => {
   const h = gateHarness();
+  const codeWrite = { path: "src/index.ts" };
   try {
     await h.start("s-mgmt");
     assert(
-      (await h.toolCall("s-mgmt", "read"))?.block === true,
-      "read must be blocked before any call",
+      (await h.toolCall("s-mgmt", "edit", codeWrite))?.block === true,
+      "a source edit must be blocked before any call",
     );
     assert(
       (await h.toolCall("s-mgmt", "subagent", { action: "status" })) === undefined,
       "a management action must not itself be blocked",
     );
     assert(
-      (await h.toolCall("s-mgmt", "read"))?.block === true,
+      (await h.toolCall("s-mgmt", "edit", codeWrite))?.block === true,
       "a management action must not open the gate",
     );
     assert((await h.toolCall("s-mgmt", "subagent")) === undefined, "a real spawn must pass");
-    assert((await h.toolCall("s-mgmt", "read")) === undefined, "a real spawn must open the gate");
+    assert((await h.toolCall("s-mgmt", "edit", codeWrite)) === undefined, "a real spawn must open the gate");
   } finally {
     h.cleanup();
   }
+});
+
+// The policy table: what the gate must block and what it must let through.
+runCase("CASE 37: decideToolGate blocks only positively identified code writes", () => {
+  const armed = { active: true, enforce: true, topLevel: true, spawnInFlight: false, delegated: false };
+  const table = [
+    { toolName: "bash", input: { command: "pi install npm:foo" }, block: false },
+    { toolName: "bash", input: { command: "git status" }, block: false },
+    { toolName: "read", input: { path: "src/index.ts" }, block: false },
+    { toolName: "bash", input: { command: "npx tsc --noEmit" }, block: false },
+    { toolName: "edit", input: { path: "src/index.ts" }, block: true },
+    { toolName: "write", input: { path: "README.md" }, block: false },
+    { toolName: "bash", input: { command: "git commit -m x" }, block: true },
+    { toolName: "bash", input: { command: "npm i left-pad" }, block: true },
+    { toolName: "bash", input: { command: "rm -rf /tmp/x" }, block: true },
+  ];
+  const rows = [];
+  let wrong = 0;
+  for (const row of table) {
+    const decision = decideToolGate({ ...armed, toolName: row.toolName, input: row.input });
+    const ok = decision.block === row.block;
+    if (!ok) wrong += 1;
+    rows.push(
+      `${ok ? "PASS" : "FAIL"} ${row.toolName} ${JSON.stringify(row.input)} => ${decision.block ? "block" : "allow"}`,
+    );
+  }
+  for (const row of rows) console.log(`  ${row}`);
+  assert(wrong === 0, `${wrong} row(s) disagreed with the policy table`);
+});
+
+runCase("CASE 38: direct work never needs delegation (reads, tooling, builds, tests, config, docs)", () => {
+  const armed = { active: true, enforce: true, topLevel: true, spawnInFlight: false, delegated: false };
+  const direct = [
+    { toolName: "grep", input: { pattern: "migrate" } },
+    { toolName: "find", input: { pattern: "*.ts" } },
+    { toolName: "ls", input: { path: "src" } },
+    { toolName: "lsp_definition", input: { path: "src/index.ts" } },
+    { toolName: "bash", input: { command: "npm i -g typescript" } },
+    { toolName: "bash", input: { command: "npm test" } },
+    { toolName: "bash", input: { command: "npm run build" } },
+    { toolName: "bash", input: { command: "vitest run" } },
+    { toolName: "bash", input: { command: "pytest -q" } },
+    { toolName: "bash", input: { command: "git log --oneline -5" } },
+    { toolName: "bash", input: { command: "git diff" } },
+    { toolName: "bash", input: { command: "grep -rn migrate src" } },
+    { toolName: "edit", input: { path: "docs/guide.md" } },
+    { toolName: "edit", input: { path: join(homedir(), ".pi", "agent", "extensions", "foo.ts") } },
+    { toolName: "write", input: { path: "package.json" } },
+    { toolName: "ctx_execute", input: { language: "javascript", code: "console.log(1)" } },
+    { toolName: "todo", input: {} },
+    { toolName: "edit", input: {} },
+  ];
+  for (const call of direct) {
+    const decision = decideToolGate({ ...armed, ...call });
+    assert(!decision.block, `${call.toolName} ${JSON.stringify(call.input)} must not be blocked: ${decision.reason}`);
+  }
+});
+
+runCase("CASE 39: more blocked categories (repo state, dependency, formatter, migration, redirect)", () => {
+  const armed = { active: true, enforce: true, topLevel: true, spawnInFlight: false, delegated: false };
+  const blocked = [
+    { toolName: "bash", input: { command: "git push origin main" } },
+    { toolName: "bash", input: { command: "git reset --hard" } },
+    { toolName: "bash", input: { command: "yarn add left-pad" } },
+    { toolName: "bash", input: { command: "pip install requests" } },
+    { toolName: "bash", input: { command: "npx prettier --write src" } },
+    { toolName: "bash", input: { command: "npx eslint --fix src" } },
+    { toolName: "bash", input: { command: "gofmt -w main.go" } },
+    { toolName: "bash", input: { command: "prisma migrate deploy" } },
+    { toolName: "bash", input: { command: "cat a > src/index.ts" } },
+    { toolName: "write", input: { path: "packages/core/index.ts" } },
+    { toolName: "edit", input: { path: "app/page.py" } },
+  ];
+  for (const call of blocked) {
+    const decision = decideToolGate({ ...armed, ...call });
+    assert(decision.block, `${call.toolName} ${JSON.stringify(call.input)} should be blocked`);
+  }
+});
+
+runCase("CASE 40: isSourcePath classifies source, docs and config", () => {
+  for (const path of ["src/index.ts", "lib/a.js", "app/page.py", "call.rs", "a.sql", "x/y.go", "z.sh"]) {
+    assert(isSourcePath(path), `${path} should be source`);
+  }
+  for (const path of ["README.md", "docs/a.mdx", "package.json", "src/README.md", ""]) {
+    assert(!isSourcePath(path), `${path} should not be source`);
+  }
+});
+
+runCase("CASE 41: isReadOnlyCommand table", () => {
+  const table = [
+    ["git status", true],
+    ["git log --oneline", true],
+    ["ls -la", true],
+    ["grep -rn foo src", true],
+    ["npm view x version", true],
+    ["rm -rf /tmp/x", false],
+    ["git reset --hard", false],
+    ["pi install npm:foo", false],
+    ["echo hi > f", false],
+    ["sed -i s/a/b/ f", false],
+    ["curl -X POST url", false],
+    ["npm install", false],
+  ];
+  let wrong = 0;
+  for (const [command, expected] of table) {
+    const actual = isReadOnlyCommand(command);
+    const ok = actual === expected;
+    if (!ok) wrong += 1;
+    console.log(`  ${ok ? "PASS" : "FAIL"} ${JSON.stringify(command)} => ${actual} (expected ${expected})`);
+  }
+  assert(wrong === 0, `${wrong} row(s) disagreed with the read-only table`);
 });
 
 if (failures > 0) {

@@ -1,11 +1,11 @@
 # pi-orchestrator
 
 A pi extension that ships a default agent workflow, injects it into the system
-prompt where an `AGENTS.md` would go, and enforces it by blocking direct file
-work until a subagent has been spawned. Installing the package gives you a
-working plan -> implement -> review loop without writing an AGENTS.md. The
-model roster lives in pi-failover, which is a required companion and registers
-`model_roster` itself.
+prompt where an `AGENTS.md` would go, and enforces it by blocking direct code
+changes, not reads or builds, until a subagent has been spawned. Installing the
+package gives you a working plan -> implement -> review loop without writing an
+AGENTS.md. The model roster lives in pi-failover, which is a required companion
+and registers `model_roster` itself.
 
 ## What it does
 
@@ -20,21 +20,50 @@ list - which is the weakest position available and is why the workflow used to
 be readable but ignored.
 
 **Enforcement.** `tool_call` handlers can block a call. Until a `subagent` spawn
-has happened in that session, the gate blocks every file-reading and
-file-mutating tool (`read`, `grep`, `find`, `ls`, `bash`, `powershell`, `edit`,
-`write`, `codemode`, `lsp_*`, `ctx_*`). Reading is gated on purpose: with reads
-open, the model gathers context itself, concludes the files are "already
-known", and the workflow's own "skip scout when files are known" clause
-licenses skipping the delegation.
+has happened in that session, the gate blocks a *project code write* and
+nothing else.
 
-`subagent` and `ask_user` always pass. Child agent sessions are exempt, because
-pi-subagents runs children as pi sessions inside the same process and gating
-them would deadlock the scout the gate exists to force. Counts are per session
-and per spawn, so a failed or abandoned spawn cannot leave the gate stuck open.
+### What the gate blocks
 
-A completed top-level `edit`/`write` re-arms that session: the next change must
+- Edits and writes to a source file: a code extension (`.ts`, `.tsx`, `.js`,
+  `.py`, `.go`, `.rs`, `.java`, `.sh`, and the like), or any file under `src/`,
+  `app/`, `lib/`, `packages/`, `extensions/`. A docs extension wins over the
+  directory rule, so `src/README.md` stays a direct edit.
+- Commands that change tracked repository state: `git commit`, `push`, `reset`,
+  `checkout`, `rebase`, `merge`, `cherry-pick`, `revert`, `clean`,
+  `git stash drop`, `git tag -d`.
+- Project-local dependency installs: `npm i`, `yarn add`, `pnpm add`,
+  `pip install`, `cargo add`, `go get`.
+- A formatter or linter in its write mode: `prettier --write`, `eslint --fix`,
+  `gofmt -w`, `rustfmt`.
+- Migrations.
+- An irreversible delete (`rm`, `shred`, `truncate`, `dd`), or a redirect into a
+  source file.
+
+### What passes directly
+
+- Reads, `grep`, `find`, `ls`, LSP tools, `ctx_search`, web tools.
+- Builds and type checks (`npx tsc`, `npm run build`), and test runs (`npm
+  test`, `vitest`, `pytest`).
+- Tooling installs: `pi install`, `pi uninstall`, `npm i -g`.
+- `git status|log|diff|show|branch|remote|fetch`.
+- Documentation and config edits (`.md`, `.json`, `.yaml`, `.toml`), wherever
+  they live.
+- Anything under the pi agent dir (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`).
+
+Classification is permissive on purpose. An unknown tool, an unparseable
+command, or a write we cannot classify is allowed, so a misclassification errs
+toward letting work through, never toward blocking it: a wrong block costs a
+scout/oracle/worker round trip for work that never needed one, which is the
+failure that made ordinary tasks unusable. `subagent` and `ask_user` always
+pass. Child agent sessions are exempt, because pi-subagents runs children as pi
+sessions inside the same process and gating them would deadlock the scout the
+gate exists to force. Counts are per session and per spawn, so a failed or
+abandoned spawn cannot leave the gate stuck open.
+
+A completed top-level code write re-arms that session: the next code change must
 delegate again, which is what keeps implementation on `worker` instead of in the
-orchestrator.
+orchestrator. An inspection or a test run does not re-arm.
 
 **Workflow.** The packaged default in `assets/ORCHESTRATOR.example.md` is
 injected only when all four required companion extensions are installed;
@@ -77,8 +106,10 @@ load; it never throws into a session.
 
 Enforcement has one switch: `WORKFLOW_ENFORCE=off` (also `0`, `false`, `no`)
 disables the gate for the process while leaving injection intact. There is no
-per-task bypass: the workflow's own triviality test is a judgement the gate
-cannot make, and a bypass command is exactly what gets used to skip the work.
+per-task bypass: the gate classifies the shape of a write, not the significance
+of the work, so it cannot decide that one particular task is small enough to
+skip delegation, and a bypass command is exactly what gets used to skip the
+work.
 
 `/workflow` reports which workflow source won (your `ORCHESTRATOR.md` with its
 path, or the packaged default with its mtime); `/workflow init` copies the
@@ -157,11 +188,16 @@ render or inject the model roster: that section belongs to pi-failover. Policy
 (which class to pick when, escalation rules, review discipline) lives in your
 `ORCHESTRATOR.md`, or in the packaged default workflow when you have none.
 
-It also does not judge your task. It cannot tell a one-line fix from an
-architecture change, so it enforces the shape of the work (delegate, then do)
-rather than the classification of it. `bash` writes remain a hole: the gate
-blocks `bash` before a spawn, but after one, a spawn-backed shell can still
-write files. If that matters, gate `bash` yourself or run without it.
+It also does not judge your task. It recognises the shape of a code write, not
+the significance of a task: it cannot tell a new feature from a one-line typo
+fix, so it enforces the shape of the work (delegate, then do) for the one class
+it can name, project code writes, and lets everything else through. The
+orchestration judgement for genuine feature work still lives in the injected
+prompt, not in the gate. The remaining hole is a code write no text pattern
+can name: `node -e 'fs.writeFileSync(...)'`, `cp src/a.ts src/b.ts`, a
+`codemode` script, or a JS `ctx_execute` body are all allowed, because calling
+them writes would be a guess. Treat the gate as a nudge toward the workflow,
+not a sandbox.
 
 ## Publishing
 

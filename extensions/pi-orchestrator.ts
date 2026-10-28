@@ -13,10 +13,15 @@
  *    carries the workflow twice.
  *
  * 2. Enforcement. `tool_call` can block a call (`return { block: true }`). The
- *    gate blocks every file-reading or file-mutating tool until a `subagent`
- *    spawn has happened in that session. Without it, the model reads the repo
- *    itself, decides the files are "already known", and your own step-1 clause
- *    licenses skipping scout and oracle.
+ *    gate blocks a *project code write* - `edit`/`write` of a source file, a
+ *    `git commit`, a dependency install, a formatter's write mode - until a
+ *    `subagent` spawn has happened in that session. Without it, the model
+ *    edits the code itself and your own workflow clause licenses skipping
+ *    scout and oracle. Everything else (reads, greps, LSP, builds, test runs,
+ *    `pi install`, config edits under the agent dir) passes straight through:
+ *    the gate exists to force delegation for code changes, not to tax
+ *    inspection. Classification fails open, so an unrecognised tool is allowed
+ *    rather than charged a delegation round trip.
  *
  * State is keyed by session id, never by module-level "current task", so two
  * sessions in one process cannot borrow each other's delegation. Enforcement
@@ -40,7 +45,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 function mtimeOf(path: string): number | null {
@@ -203,22 +208,375 @@ export function applyWorkflowToPrompt(
   if (options.sections) delete options.sections[LEGACY_SECTION_KEY];
 }
 
+// ---------------------------------------------------------------------------
+// Code-write classification
+//
+// The gate exists for one case: a change to project code should go through
+// scout/oracle/worker first. Inspection, tooling, builds, test runs, package
+// installs and user-level config all go direct. Every classifier here fails
+// OPEN: a path or command that cannot be classified is allowed, because a
+// wrong block costs a full delegation round trip that the work never needed.
+// ---------------------------------------------------------------------------
+
+const SOURCE_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".py",
+  ".go",
+  ".rs",
+  ".java",
+  ".kt",
+  ".c",
+  ".cc",
+  ".cpp",
+  ".h",
+  ".hpp",
+  ".cs",
+  ".rb",
+  ".php",
+  ".swift",
+  ".scala",
+  ".ex",
+  ".exs",
+  ".sh",
+  ".sql",
+  ".vue",
+  ".svelte",
+  ".astro",
+]);
+
+/** Docs, data and config: editing these is never a code change, wherever they live. */
+const DOC_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".md",
+  ".mdx",
+  ".rst",
+  ".adoc",
+  ".txt",
+  ".json",
+  ".jsonc",
+  ".yaml",
+  ".yml",
+  ".toml",
+  ".ini",
+  ".lock",
+  ".xml",
+  ".html",
+  ".css",
+  ".scss",
+  ".svg",
+  ".csv",
+  ".log",
+]);
+
+const SOURCE_DIRECTORIES: ReadonlySet<string> = new Set(["src", "app", "lib", "packages", "extensions"]);
+
 /**
- * Tools that can read or write repository state. Blocking reads is deliberate:
- * with reads open, the model gathers the context itself, then reasons that the
- * files are "already known" and skips the recon the workflow asks for.
+ * True when a path names project source: a code extension, or a file under a
+ * source directory. A docs extension wins over the directory rule, so
+ * `src/README.md` and `packages/x/package.json` stay direct edits.
  */
-const GATED_TOOL = /^(read|grep|find|ls|bash|powershell|edit|write|codemode|lsp_|ctx_)/;
+export function isSourcePath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/").trim();
+  if (normalized === "") return false;
+  const lower = normalized.toLowerCase();
+  const extension = extname(lower);
+  if (DOC_EXTENSIONS.has(extension)) return false;
+  if (SOURCE_EXTENSIONS.has(extension)) return true;
+  // Directories only: a *file* named `src` does not make its neighbours source.
+  const segments = lower.split("/").filter(Boolean);
+  return segments.slice(0, -1).some((segment) => SOURCE_DIRECTORIES.has(segment));
+}
 
-/** Tools that must always pass: spawning is the way out of the gate. */
-const ALWAYS_ALLOWED = new Set(["subagent", "ask_user"]);
+/** pi's own config tree: tooling and settings, never the project's code. */
+export function isAgentConfigPath(path: string): boolean {
+  const raw = path.trim();
+  const expanded = raw === "~" || raw.startsWith("~/") ? join(homedir(), raw.slice(1)) : raw;
+  // A relative path cannot be positively identified as agent config: resolving
+  // it against the process cwd would exempt whatever the cwd happens to be.
+  if (!isAbsolute(expanded)) return false;
+  const target = resolve(expanded);
+  const configDir = resolve(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"));
+  return target === configDir || target.startsWith(configDir + sep);
+}
 
-function isMutatingTool(toolName: string): boolean {
-  return /^(edit|write)$/.test(toolName) || /^(bash|powershell|codemode)$/.test(toolName);
+/** Shell-ish tools whose input carries a command whose text we can classify. */
+const SHELL_COMMAND_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  bash: ["command", "cmd"],
+  powershell: ["command"],
+  ctx_execute: ["code"],
+};
+
+/** The command string for a shell tool, or null when there is nothing to read. */
+function shellCommandOf(toolName: string, input: unknown): string | null {
+  const fields = SHELL_COMMAND_FIELDS[toolName];
+  if (!fields || typeof input !== "object" || input === null) return null;
+  const record = input as Record<string, unknown>;
+  if (toolName === "ctx_execute") {
+    // Other languages are program text, not commands; nothing to classify.
+    const language = typeof record.language === "string" ? record.language.toLowerCase() : "";
+    if (language !== "shell" && language !== "bash") return null;
+  }
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim() !== "") return value;
+  }
+  return null;
+}
+
+/** Write-ish tokens. A command carrying one is not read-only. */
+const WRITE_TOKENS: readonly RegExp[] = [
+  />/, // any redirect, including `>>` and `2>`, can write a file
+  /<</, // a heredoc feeds a command we cannot inspect
+  /\btee\b/,
+  /\bsed\s+-i/,
+  /--output\b/,
+  /(^|\s)-o\s/, // `-o file` (curl, tsc, sort, ...): output to a file
+  /\bsudo\b/,
+  /\bxargs\b/,
+  /\b(rm|rmdir|mv|cp|mkdir|touch|chmod|chown|chgrp|ln|truncate|dd|mkfs|shred|kill|pkill|systemctl)\b/,
+  /\bgit\s+(add|am|apply|checkout|cherry-pick|clean|clone|commit|fetch|init|merge|mv|pull|push|rebase|reset|restore|rm|stash|switch|tag)\b/,
+  /\bgit\s+config\s+(?!.*--get)/,
+  /\b(npm|yarn|pnpm)\s+(ci|i|install|add|link|pack|prune|publish|rm|run|uninstall|update)\b/,
+  /\bpi\s+(install|uninstall|update|remove|add)\b/,
+];
+
+function hasWriteToken(text: string): boolean {
+  return WRITE_TOKENS.some((pattern) => pattern.test(text));
+}
+
+/** Read-only binaries: no subcommand allowlist means the whole invocation is safe. */
+const READ_ONLY_BINARIES: ReadonlySet<string> = new Set([
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "grep",
+  "rg",
+  "fd",
+  "find",
+  "file",
+  "stat",
+  "pwd",
+  "echo",
+  "printf",
+  "which",
+  "type",
+  "env",
+  "whoami",
+  "date",
+  "jq",
+  "diff",
+  "cmp",
+  "tree",
+  "du",
+  "df",
+  "sort",
+  "uniq",
+  "cut",
+  "awk",
+  "sed",
+  "xxd",
+  "base64",
+  "git",
+  "npm",
+  "node",
+  "python3",
+  "tsc",
+  "pi",
+  "gh",
+  "curl",
+  "wget",
+]);
+
+/** Read-only subcommands, per binary that has both safe and unsafe ones. */
+const READ_ONLY_SUBCOMMANDS: Readonly<Record<string, readonly string[]>> = {
+  git: [
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "remote",
+    "rev-parse",
+    "describe",
+    "blame",
+    "config --get",
+    "ls-files",
+    "grep",
+  ],
+  npm: ["view", "ls", "list", "info", "outdated", "audit", "why", "explain", "config get", "pkg get"],
+  gh: ["view", "list", "status", "diff", "api"],
+  pi: ["list", "--version", "--help", "status"],
+};
+
+/** A non-GET request method, or a body/file flag, makes an HTTP call a write. */
+const NON_GET_METHOD = /(^|\s)(-X|--request|--method)\s+(POST|PUT|PATCH|DELETE)\b/i;
+const CURL_WRITE_FLAGS = /(^|\s)(-d|--data|--data-raw|--data-binary|--data-urlencode|-F|--form|--form-string|-T|--upload-file)\b/;
+const WGET_WRITE_FLAGS = /(^|\s)(--post-data|--post-file|-O|--output-document|--method=)\b/;
+const GH_API_WRITE_FLAGS = /(^|\s)(-f|--field|-F|--raw-field|--input)\b/;
+
+/** Classify one segment (no pipes or separators) as read-only. */
+function isReadOnlySegment(segment: string): boolean {
+  const words = segment.split(/\s+/);
+  // Skip a leading `VAR=value` prefix, so `FOO=1 ls` classifies as `ls`.
+  let index = 0;
+  while (index < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index])) index += 1;
+  const binary = words[index];
+  // A path form (`./tool`, `/usr/bin/ls`) is unclassifiable by name: block.
+  if (binary === undefined || !READ_ONLY_BINARIES.has(binary)) return false;
+
+  const rest = words.slice(index + 1).join(" ");
+  const allowed = READ_ONLY_SUBCOMMANDS[binary];
+  if (allowed && !allowed.some((entry) => rest === entry || rest.startsWith(`${entry} `))) return false;
+
+  if (binary === "curl" && (NON_GET_METHOD.test(rest) || CURL_WRITE_FLAGS.test(rest))) return false;
+  if (binary === "wget" && (NON_GET_METHOD.test(rest) || WGET_WRITE_FLAGS.test(rest))) return false;
+  if (binary === "gh" && /^api\b/.test(rest) && (NON_GET_METHOD.test(rest) || GH_API_WRITE_FLAGS.test(rest))) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * True when a shell command only inspects: every segment of a compound command
+ * classifies read-only and no write token appears anywhere.
+ *
+ * Used as a positive allow signal, so a deny pattern can never catch an
+ * inspection (`grep migrate src` stays direct). Being conservative here only
+ * costs accuracy, not safety: a `false` merely falls through to the deny list.
+ */
+export function isReadOnlyCommand(command: string): boolean {
+  const text = command.trim();
+  if (text === "" || hasWriteToken(text)) return false;
+  const segments = text.split(/(?:\|\||&&|[;&|\n])/);
+  let seen = 0;
+  for (const segment of segments) {
+    const trimmed = segment.trim();
+    if (trimmed === "") continue;
+    seen += 1;
+    if (!isReadOnlySegment(trimmed)) return false;
+  }
+  return seen > 0;
+}
+
+/** Files written by `>`/`>>`/`tee`, which a code write could hide behind. */
+function redirectTargets(command: string): string[] {
+  const targets: string[] = [];
+  for (const match of command.matchAll(/(?:>>?|\btee)\s+([^\s;|&]+)/g)) targets.push(match[1]);
+  return targets;
+}
+
+interface BashRule {
+  pattern: RegExp;
+  why: string;
+  /** A global install (`-g`, `--global`) is tooling, not a project dependency. */
+  globalExempt?: boolean;
+}
+
+/** Positively identified code writes in a shell command. */
+const BASH_CODE_WRITE_RULES: readonly BashRule[] = [
+  {
+    pattern: /\bgit\s+(commit|push|reset|checkout|rebase|merge|cherry-pick|revert|clean)\b/,
+    why: "it changes tracked repository state",
+  },
+  { pattern: /\bgit\s+stash\s+(drop|clear)\b/, why: "it drops stashed work" },
+  { pattern: /\bgit\s+tag\s+(-d|--delete)\b/, why: "it deletes a tag" },
+  {
+    pattern: /\b(npm|yarn|pnpm)\s+(i|install|add|ci)\b/,
+    why: "it installs project dependencies",
+    globalExempt: true,
+  },
+  { pattern: /\b(pip|pip3)\s+install\b/, why: "it installs project dependencies", globalExempt: true },
+  { pattern: /\bcargo\s+add\b/, why: "it adds a dependency" },
+  { pattern: /\bgo\s+get\b/, why: "it adds a dependency" },
+  { pattern: /\b(migrate|migration|db:migrate)\b/, why: "it runs a database migration" },
+  { pattern: /\bprettier\b[^;|]*--write\b/, why: "it reformats files in place" },
+  { pattern: /\beslint\b[^;|]*--fix\b/, why: "it rewrites files in place" },
+  { pattern: /\bgofmt\s+-w\b/, why: "it reformats files in place" },
+  { pattern: /\brustfmt\b(?![^;|]*--check)/, why: "it reformats files in place" },
+  { pattern: /\bcargo\s+fmt\b(?![^;|]*--check)/, why: "it reformats files in place" },
+  {
+    pattern: /\b(rm|rmdir|shred|truncate|dd|mkfs(?:\.\w+)?)\b/,
+    why: "it deletes or overwrites files irreversibly",
+  },
+];
+
+const GLOBAL_FLAG = /(^|\s)(-g|--global)\b/;
+
+/** Why a shell command is a code write, or null when it is not one we can name. */
+function matchBashCodeWrite(command: string): string | null {
+  const global = GLOBAL_FLAG.test(command);
+  for (const rule of BASH_CODE_WRITE_RULES) {
+    if (rule.globalExempt && global) continue;
+    if (rule.pattern.test(command)) return rule.why;
+  }
+  return null;
+}
+
+/** The file path a writing tool targets, or null when its input names none. */
+const WRITE_PATH_FIELDS = ["path", "file_path", "filePath"];
+
+function targetPathOf(input: unknown): string | null {
+  if (typeof input !== "object" || input === null) return null;
+  const record = input as Record<string, unknown>;
+  for (const field of WRITE_PATH_FIELDS) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim() !== "") return value;
+  }
+  return null;
+}
+
+/**
+ * Tools that write a file named by their input. `edit`/`write` are pi's own;
+ * the rest are the common spellings other tool sets use for the same thing.
+ */
+const PATH_WRITE_TOOL = /^(edit|write|patch|multi_edit|apply_patch|notebook_edit)$/;
+
+/** A positively identified code write, with the evidence for the block reason. */
+export interface CodeWrite {
+  why: string;
+}
+
+/**
+ * Classify a call as a project code write, or null to let it run.
+ *
+ * Null is the default on purpose: unknown tool, unreadable input, a command we
+ * cannot parse, and any inspection all mean "no delegation needed".
+ */
+export function classifyCodeWrite(toolName: string, input: unknown): CodeWrite | null {
+  if (PATH_WRITE_TOOL.test(toolName)) {
+    const path = targetPathOf(input);
+    if (path === null) return null;
+    // pi's own config is tooling, never the project's code.
+    if (isAgentConfigPath(path)) return null;
+    if (!isSourcePath(path)) return null;
+    return { why: `${path} is source code` };
+  }
+
+  const command = shellCommandOf(toolName, input);
+  if (command === null) return null;
+  // An inspection is never a code write, whatever the deny rules say.
+  if (isReadOnlyCommand(command)) return null;
+
+  for (const target of redirectTargets(command)) {
+    if (isSourcePath(target) && !isAgentConfigPath(target)) {
+      return { why: `it writes ${target}, which is source code` };
+    }
+  }
+
+  const why = matchBashCodeWrite(command);
+  return why === null ? null : { why };
 }
 
 export interface GateInput {
   toolName: string;
+  /** Raw tool input; read only to classify a write. */
+  input?: unknown;
   /** The workflow is injected for this session, so it can be enforced. */
   active: boolean;
   /** `WORKFLOW_ENFORCE=off` and similar. */
@@ -239,21 +597,24 @@ export interface GateDecision {
 /** Pure gate decision, so the enforcement rules are testable without pi. */
 export function decideToolGate(input: GateInput): GateDecision {
   if (!input.enforce || !input.active) return { block: false };
-  if (ALWAYS_ALLOWED.has(input.toolName)) return { block: false };
-  if (!GATED_TOOL.test(input.toolName)) return { block: false };
   // Children run as pi sessions in this process; gating them would deadlock scout.
   if (!input.topLevel || input.spawnInFlight) return { block: false };
   if (input.delegated) return { block: false };
 
-  const what = isMutatingTool(input.toolName) ? "change files" : "inspect the repository";
+  // Everything not positively identified as a code write passes: an unknown
+  // tool must never cost a scout/oracle/worker round trip.
+  const write = classifyCodeWrite(input.toolName, input.input);
+  if (write === null) return { block: false };
+
   return {
     block: true,
     reason: [
-      `Blocked: ${input.toolName} cannot be used to ${what} yet.`,
-      "The active workflow requires delegation before direct work:",
+      `Blocked: ${input.toolName} would change project code (${write.why}).`,
+      "The active workflow requires delegation before a code change:",
       'recon with subagent({ agent: "scout", task: "..." }), design with',
       'subagent({ agent: "oracle", task: "..." }), then implement with',
       'subagent({ agent: "worker", task: "..." }). Start with scout or oracle.',
+      "Reads, builds, test runs, package installs and config edits never need this.",
     ].join(" "),
   };
 }
@@ -273,6 +634,8 @@ class WorkflowGate {
   private readonly topLevelSessions = new Set<string>();
   private readonly activeSessions = new Set<string>();
   private readonly delegatedSessions = new Set<string>();
+  /** Ids of calls classified as code writes; their completion re-arms the gate. */
+  private readonly codeWriteCalls = new Set<string>();
   private spawnsInFlight = 0;
 
   /** A user-started run defines a top-level session and re-arms its gate. */
@@ -282,6 +645,7 @@ class WorkflowGate {
     // Any spawn still counted here belongs to an earlier turn that never
     // reported completion; a user turn is a safe point to drop the count.
     this.spawnsInFlight = 0;
+    this.codeWriteCalls.clear();
   }
 
   setActive(session: string, active: boolean): void {
@@ -304,9 +668,19 @@ class WorkflowGate {
     this.spawnsInFlight = Math.max(0, this.spawnsInFlight - 1);
   }
 
-  /** A top-level edit/write completed, so the next change must re-delegate. */
+  /** A code write ran, so the next one must re-delegate. */
   mutationCompleted(session: string): void {
     this.delegatedSessions.delete(session);
+  }
+
+  /** Remember a call that will need re-arming once it finishes. */
+  markCodeWrite(callId: string): void {
+    if (callId !== "") this.codeWriteCalls.add(callId);
+  }
+
+  /** True when this finished call was classified as a code write. */
+  consumeCodeWrite(callId: string): boolean {
+    return this.codeWriteCalls.delete(callId);
   }
 
   /** Current decision for a tool call in a session. */
@@ -314,9 +688,11 @@ class WorkflowGate {
     session: string,
     toolName: string,
     enforce: boolean,
+    input?: unknown,
   ): GateDecision {
     return decideToolGate({
       toolName,
+      input,
       active: this.activeSessions.has(session),
       enforce,
       topLevel: this.topLevelSessions.has(session),
@@ -328,8 +704,8 @@ class WorkflowGate {
   describe(session: string): string {
     if (!this.activeSessions.has(session)) return "enforcement: inactive (no workflow injected)";
     if (!this.topLevelSessions.has(session)) return "enforcement: child session (exempt)";
-    if (this.delegatedSessions.has(session)) return "enforcement: delegation seen, tools open";
-    return "enforcement: armed, file tools blocked until a spawn";
+    if (this.delegatedSessions.has(session)) return "enforcement: delegation seen, code writes open";
+    return "enforcement: armed, code writes blocked until a spawn";
   }
 }
 
@@ -677,7 +1053,7 @@ export default function piRoster(pi: ExtensionAPI): void {
     }
   });
 
-  // Enforce: until a spawn happens, file tools are blocked for a top-level
+  // Enforce: until a spawn happens, code writes are blocked for a top-level
   // session. `tool_call` can block; a handler failure also blocks (fail-closed).
   pi.on("tool_call", (event, ctx) => {
     const session = sessionKey(ctx);
@@ -686,7 +1062,7 @@ export default function piRoster(pi: ExtensionAPI): void {
     if (toolName === "subagent") {
       // Only a real spawn opens the gate. Management calls (`action: "status"`,
       // "steer", "pending", "interrupt") are not delegation and must not
-      // unlock file tools.
+      // unlock code writes.
       const action = (event as { input?: { action?: unknown } }).input?.action;
       if (action === undefined) gate.spawnStarted(session);
       return;
@@ -695,14 +1071,22 @@ export default function piRoster(pi: ExtensionAPI): void {
     // No subagent tool in this process means the gate is unsatisfiable here.
     if (!delegationAvailable(pi)) return;
 
-    const decision = gate.decide(session, toolName, enforcementEnabled());
+    const input = (event as { input?: unknown }).input;
+    const decision = gate.decide(session, toolName, enforcementEnabled(), input);
     if (decision.block) {
       return { block: true, reason: decision.reason ?? "blocked by pi-orchestrator" };
+    }
+
+    // `tool_execution_end` carries no input, so remember here that this call
+    // was a code write; only such a call re-arms the gate when it completes.
+    if (classifyCodeWrite(toolName, input) !== null) {
+      const callId = (event as { toolCallId?: string }).toolCallId ?? "";
+      gate.markCodeWrite(callId);
     }
   });
 
   // Pair the spawn counter so a failed or aborted spawn cannot leave the gate
-  // permanently open, and re-arm after a top-level mutation.
+  // permanently open, and re-arm after a top-level code write.
   pi.on("tool_execution_end", (event, ctx) => {
     const toolName = (event as { toolName?: string }).toolName ?? "";
     const session = sessionKey(ctx);
@@ -710,7 +1094,9 @@ export default function piRoster(pi: ExtensionAPI): void {
       gate.spawnEnded();
       return;
     }
-    if (gate.isTopLevel(session) && isMutatingTool(toolName)) {
+    const callId = (event as { toolCallId?: string }).toolCallId ?? "";
+    const wasCodeWrite = gate.consumeCodeWrite(callId);
+    if (wasCodeWrite && gate.isTopLevel(session)) {
       const isError = Boolean((event as { isError?: boolean }).isError);
       if (!isError) gate.mutationCompleted(session);
     }
