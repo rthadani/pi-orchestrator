@@ -40,6 +40,31 @@ Follow these rules whenever a task involves designing or changing code here.
    Presenting a plan built on unspoken assumptions counts as a workflow
    failure.
 
+   **Plan the parallelism in the plan.** When a change spans more than one
+   file area, `oracle` must return a **work partition** alongside its plan:
+   one entry per work unit, each declaring
+
+   - `owns` — the exact file paths that unit may write. Single paths only, no
+     globs, no directories, no "the auth module".
+   - `exports` — every signature this unit creates or changes, written out in
+     full.
+   - `consumes` — every signature from another unit that this unit calls.
+   - `phase` — an integer.
+
+   Units in the same phase must have no `consumes` edge between them. A unit
+   that consumes another unit's export goes in a strictly later phase.
+
+   **Freeze the contract before the first parallel spawn.** Every `exports`
+   entry that a `consumes` entry depends on is written out verbatim in the
+   partition and landed on disk by a single `worker` working alone, before the
+   first parallel phase begins. Parallel workers then consume a file that
+   already exists, never another worker's in-flight edit.
+
+   **Name the units that cannot be parallelized.** A dependency cycle, or a
+   unit whose real file set is unknown until work starts, collapses to
+   sequential work. State that in the partition rather than discovering it in
+   a collision.
+
 2. **Pause after planning only when the plan needs a real decision.** Once
    `oracle` returns, review the plan before implementing:
    - **Proceed straight to `worker`** when the design matches what the user
@@ -71,6 +96,35 @@ Follow these rules whenever a task involves designing or changing code here.
    it inherits the session model, which is not the intended routing.
    If you find yourself about to call `write` or `edit` on this repo's source
    files directly, stop and delegate to `worker` instead.
+
+   **Parallel phases, with `worker` still the only writer.** When the approved
+   partition has a phase containing two or more units, spawn that whole phase
+   as one concurrent fanout:
+
+   `subagent({ workflow: "parallel", args: { tasks: [{ agent: "worker",
+   model, task }, { agent: "worker", model, task }] } })`
+
+   The rules that make that safe:
+
+   - One unit per worker, and the prompt names that unit's `owns` paths
+     verbatim. A worker that needs a file outside its `owns` list stops and
+     reports instead of writing it.
+   - Phases run in ascending order. Phase N+1 does not spawn until every
+     worker in phase N has returned.
+   - Children never run git: no `add`, `commit`, `stash`, `checkout`, or
+     `reset`. The parent commits after the phase returns, so two workers
+     cannot stomp one index.
+   - Children do not run the test suite in a shared working directory. Run it
+     once after the phase returns, or isolate the fanout with `worktree: true`.
+   - Shared surfaces stay parent-owned: barrel and index files, route tables,
+     export lists, changelogs, and anything sequentially numbered such as
+     migrations. The parent applies those after the phase.
+   - Before believing a worker's report, check `git diff --stat` against that
+     unit's `owns` list.
+
+   Use `worktree: true` on the fanout instead whenever the partition cannot
+   give every unit in the phase a disjoint file set, or when units are
+   expected to touch the same file. Merge the branches after the phase.
 
    **Wrap steps 3–5 in boomerang.** Once the plan is approved and no further
    user decisions are needed, invoke the `boomerang` tool with the full
@@ -123,6 +177,10 @@ Follow these rules whenever a task involves designing or changing code here.
    hit with unresolved issues, summarize the remaining findings for the user
    instead of continuing to loop silently.
 
+   Fix rounds may fan out on the same phase rule when the findings partition
+   cleanly into disjoint file sets. Otherwise send the round to a single
+   `worker`.
+
 6. **Re-plan when the request is new, not to re-litigate an approved plan.**
    Don't spawn a second `oracle` run for the same task unless the user asks
    for a revised plan or the plan was rejected. Do run `oracle` again when a
@@ -137,8 +195,10 @@ Follow these rules whenever a task involves designing or changing code here.
   context for `oracle` before design (see step 1).
 - `researcher` — web research, read-only. Conditionally produces a sourced
   brief for `oracle` during design (see step 1).
-- `worker` — the only agent that writes code. Always delegated to, never
-  replaced by the parent doing it directly.
+- `worker` — the only agent that writes code, and still the only one during a
+  parallel phase. Always delegated to, never replaced by the parent doing it
+  directly. Runs one unit at a time; a parallel phase runs one worker per
+  unit, never two workers on one unit.
 - `reviewer` — read-only critique of a diff, never edits. Run three at once
   in the review phase (correctness, tests, simplicity), never just one.
 
@@ -216,7 +276,9 @@ subject to the opus approval rule.
 - **non-trivial, or any carve-out area → the `coding` class**
 
 `worker`'s classes are `flash` and `coding` only; `sonnet` is for `oracle`,
-`reviewer` and `researcher`.
+`reviewer` and `researcher`. In a parallel phase, pass `model` on every entry
+of the `tasks` array; an entry without one inherits the session model, which
+is not the intended routing.
 
 **Mechanical operations go to `flash`, whatever their blast radius.**
 `git add`/`commit`/`push`, file moves, renames, formatting, and config
