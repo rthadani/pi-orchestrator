@@ -11,15 +11,27 @@ on:
         type: boolean
         default: true
 
+# contents: write is for the GitHub release; id-token: write is the OIDC token
+# npm exchanges for a short-lived publish credential.
 permissions:
-  contents: read
+  contents: write
   id-token: write
+
+# One publish at a time, keyed by ref. A second tag pushed during a run waits
+# instead of racing the registry.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Release notes diff against the previous tag, so the whole history
+          # and all tags have to be present.
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -33,8 +45,16 @@ jobs:
             echo "Tag '${GITHUB_REF_NAME}' (v${tag_version}) does not match package version '${pkg_version}'."
             exit 1
           fi
+      - name: Check the version is not already published
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "${name}@${version} is already on the registry; bump the version before tagging."
+            exit 1
+          fi
       - name: Run tests
-        run: node test/workflow.test.mjs
+        run: npm test
       - name: Upgrade npm for trusted publishing
         run: npm install -g npm@^11.5.1
       - name: Publish to npm
@@ -46,3 +66,15 @@ jobs:
           else
             npm publish --access public
           fi
+      - name: Create the GitHub release
+        # A manual run publishes no new version, so it gets no release. On a tag
+        # push inputs.dry_run is unset, which is why the negation is written
+        # this way.
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

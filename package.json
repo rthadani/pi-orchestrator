@@ -26,6 +26,11 @@
   "bugs": {
     "url": "https://github.com/rthadani/pi-orchestrator/issues"
   },
+  "scripts": {
+    "test": "node test/workflow.test.mjs",
+    "prepublishOnly": "node test/workflow.test.mjs",
+    "release": "bash scripts/release.sh"
+  },
   "files": [
     "extensions",
     "assets",

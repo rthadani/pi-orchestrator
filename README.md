@@ -214,22 +214,40 @@ an empty environment. The workflow filename is part of the trust binding:
 renaming or moving `.github/workflows/publish.yml` breaks publishing until the
 registration is updated.
 
-Publishing happens from CI when a version tag is pushed: the maintainer bumps
-`version` in package.json, commits, then runs
-`git tag v<version> && git push origin v<version>`. The workflow refuses to
-publish if the tag and the package version disagree. A manual run
-(`workflow_dispatch`) defaults to a dry run and uploads nothing; a `v*` tag
-publishes for real. Requirements: npm CLI >= 11.5.1 (the workflow upgrades npm
-itself) and a public repository.
+Publishing happens from CI when a version tag is pushed. From `main`, with a
+clean tree and no unpushed commits:
+
+```
+npm run release patch     # or minor, major
+```
+
+That script runs the tests, bumps `version`, commits, tags `v<version>`, and
+pushes both the commit and the tag. If you would rather do it by hand, bump
+`version` in package.json, commit, then run
+`git tag v<version> && git push origin v<version>`.
+
+The workflow then refuses to publish if:
+
+- the tag and the package version disagree;
+- that version is already on the registry (npm cannot overwrite a published
+  version, so this fails before the upload rather than during it).
+
+A successful tag push publishes to npm with provenance, then creates a GitHub
+Release at that tag with notes generated from the commits since the previous
+tag. A manual run (`workflow_dispatch`) defaults to a dry run, uploads nothing,
+and creates no release. Requirements: npm CLI >= 11.5.1 (the workflow upgrades
+npm itself) and a public repository.
 
 ## Tests
 
 ```
-node test/workflow.test.mjs
+npm test
 ```
 
 The harness needs no install and no dependencies; it exercises workflow
 resolution, installation gating, and section injection with offline fixtures.
+It also runs on `prepublishOnly`, so a manual `npm publish` cannot ship a
+failing build.
 
 ## Notes
 
