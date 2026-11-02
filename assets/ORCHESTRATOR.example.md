@@ -235,10 +235,13 @@ triage or `oracle` overrides it. Oracle's design still ends with
 grounded in the requirements; if it differs from triage, the parent applies
 it — subject to the opus approval rule above.
 
-Class names — `opus`, `sonnet`, `flash`, `coding` — are the only model
-vocabulary this workflow uses. An injected Model roster section lists each class,
+Class names — `opus`, `sonnet`, `flash`, `coding`, `coding-max` — are the only
+model vocabulary this workflow uses. An injected Model roster section lists each class,
 its models in failover order, their costs and their modalities; take every
-model name from there rather than writing one in this workflow.
+model name from there rather than writing one in this workflow. A class the
+roster does not list cannot be spawned: if `coding-max` is absent from
+`failover.json`, send that work to `coding` and say so, rather than passing a
+model name the roster never mentioned.
 
 Always pass a `failover/<name>` string; never a raw provider model id.
 
@@ -254,7 +257,9 @@ leaves a real design decision open, or the change spans more than a couple of
 files or subsystems, spawn `oracle` on the first-listed model of the `sonnet`
 class and append `:xhigh` to that model's name (the roster marks it
 `:xhigh->max`). The suffix is stripped before name resolution. Do not use
-bare `:max`, which has no entry in that `thinkingLevelMap`.
+bare `:max`, which has no entry in that `thinkingLevelMap`. For `worker` the
+same rule holds: an `:xhigh` run on the `coding` primary is the required
+cheaper step before any `coding-max` spawn, not an alternative to it.
 
 **Second opinion on a contested call.** When `oracle` returns a design with
 two viable approaches, or the decision is expensive to reverse (schema, public
@@ -275,10 +280,10 @@ subject to the opus approval rule.
 - **trivial, per step 1 → the `flash` class**
 - **non-trivial, or any carve-out area → the `coding` class**
 
-`worker`'s classes are `flash` and `coding` only; `sonnet` is for `oracle`,
-`reviewer` and `researcher`. In a parallel phase, pass `model` on every entry
-of the `tasks` array; an entry without one inherits the session model, which
-is not the intended routing.
+`worker`'s classes are `flash` and `coding` only; `coding-max` is the opt-in
+exception described below. `sonnet` is for `oracle`, `reviewer` and `researcher`.
+In a parallel phase, pass `model` on every entry of the `tasks` array; an entry
+without one inherits the session model, which is not the intended routing.
 
 **Mechanical operations go to `flash`, whatever their blast radius.**
 `git add`/`commit`/`push`, file moves, renames, formatting, and config
@@ -307,7 +312,29 @@ A three-line change in these areas is still a large change in risk.
 **Escalate when a flash run grew.** A flash `worker` cannot be killed mid-run,
 so check when it returns: re-count the files it touched, and if the finished
 work outgrew step 1's trivial test or hit a carve-out, send it no further
-edits. Finish or redo the work on the `coding` class.
+edits. Finish or redo the work on the `coding` class, not on `coding-max`.
+
+**`coding-max` is opt-in, exactly like opus.** The `coding` class primary costs
+roughly 4.6x the output price of the model behind it, so a `coding-max` spawn
+must carry a stated justification. Spawn `worker` on `coding-max` only for one
+of these, written into the spawn prompt:
+
+- a cheaper run already failed on this same unit and you name the failure: a
+  test still red, a compile error the model caused again, or a diff that
+  missed the requirement;
+- the unit is in the carve-out list above and `git diff --stat` shows it is
+  not trivial;
+- the change is a single run over measured breadth, more than about a dozen
+  files, that a cheap run cannot hold.
+
+Not a justification: importance, visibility, "best model", a model's own
+recommendation, or a wide blast radius on a small mechanical diff, which is
+`flash` work. Before the spawn, ask the user one focused question naming the
+unit, the class, the cost delta taken from the roster, and what `coding` would
+risk. Approval is per spawn, not per session, and never carries over to the
+next unit. One `coding-max` attempt per unit: if it fails, escalate to
+`oracle` instead of re-running `coding-max`. State the class and the
+justification in the final summary.
 
 **Why this routing lives in this workflow and not in failover.json.** failover.json is
 reactive-only with no task-size input, so this routing lives in the parent's

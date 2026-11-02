@@ -77,11 +77,20 @@ and whether the gate is armed.
 pi-failover owns that section: it registers `model_roster` itself, so the
 workflow can name capability classes instead of hardcoding model names.
 
+**The workflow will not run without a `coding-max` class.** The default
+workflow routes implementation across three classes, `flash`, `coding`, and the
+opt-in `coding-max`, so `~/.pi/agent/failover.json` must define all three (an
+`opus`, `sonnet`, and `flash` class alone is not enough). With no `coding-max`
+set, every `worker` spawn that names it fails to resolve, and the opt-in
+justification rule in the workflow has nothing to opt into. See
+[Classes the workflow requires](#classes-the-workflow-requires) for the shape
+to copy.
+
 ## Why it exists
 
 A workflow file like `ORCHESTRATOR.md` should name capability classes
-(`opus`, `sonnet`, `flash`, `coding` are conventional names, not required
-ones) rather than model names. That way swapping a model in `failover.json`
+(`opus`, `sonnet`, `flash`, `coding`, `coding-max` are conventional names, not
+required ones) rather than model names. That way swapping a model in `failover.json`
 never requires editing the workflow file: pi-failover's roster section always
 describes what each class currently resolves to.
 
@@ -96,6 +105,33 @@ pi-failover is a required companion, so install it too:
 ```
 pi install git:github.com/rthadani/pi-failover
 ```
+
+Then define the classes the workflow calls by. Without the `coding-max` set the
+shipped workflow cannot route `worker` for expensive work, so treat failover
+config as part of the install, not an optional tweak:
+
+### Classes the workflow requires
+
+| Class | Used by | Notes |
+| --- | --- | --- |
+| `flash` | `scout`, cheap `worker`, tests and simplicity reviewers | the default for trivial and mechanical work |
+| `coding` | `worker` for non-trivial work | keep the cheap-but-capable models first; failover advances on failure, so position 1 is the price you pay by default |
+| `coding-max` | `worker`, opt-in only | the premium coder (for example a `kimi-k2.7-code`-style model) with a cheaper model behind it, so a class-level outage still fails over |
+
+The minimum shape, inside `sets` in `~/.pi/agent/failover.json`:
+
+```json
+{
+  "name": "coding-max",
+  "models": [
+    { "name": "coding-max-primary", "provider": "moonshotai", "api": "openai-completions", "model": "kimi-k2.7-code", "cost": { "input": 0.95, "output": 4, "cacheRead": 0.19, "cacheWrite": 0 } },
+    { "name": "coding-max-fallback", "provider": "deepseek", "api": "openai-completions", "model": "deepseek-v4-pro", "cost": { "input": 0.435, "output": 0.87, "cacheRead": 0.003625, "cacheWrite": 0 } }
+  ]
+}
+```
+
+The `cost` block is what makes the price visible in the rendered roster, which
+is where the workflow's approval question and its cost delta come from.
 
 ## Behaviour
 
@@ -166,7 +202,7 @@ whether the workflow is withheld.
 | `pi-subagents` | the oracle/worker/reviewer/scout/researcher roles | `pi install npm:pi-subagents` |
 | `pi-boomerang` | long autonomous runs without raw output in context | `pi install npm:pi-boomerang` |
 | `context-mode` | bulky-I/O rules via `ctx_execute`/`ctx_batch_execute`/`ctx_search` | `pi install npm:context-mode` |
-| `pi-failover` | the failover provider, which injects the model roster and provides `failover/<name>` routing | `pi install git:github.com/rthadani/pi-failover` |
+| `pi-failover` | the failover provider, which injects the model roster, provides `failover/<name>` routing, and must define the `flash`, `coding`, and `coding-max` classes the workflow names | `pi install git:github.com/rthadani/pi-failover` + the [required classes](#classes-the-workflow-requires) |
 | `ask_user` (optional) | the one-focused-question rule | `pi install npm:pi-ask-user` |
 
 `pi-subagents`, `pi-boomerang`, `context-mode`, and `pi-failover` are required:
@@ -256,4 +292,6 @@ second copy in `~/.pi/agent/extensions/`, or the provider/section registers
 twice.
 
 Upgrade pi-orchestrator and pi-failover together, because older mixes write
-the same section key.
+the same section key. Upgrading across the `coding-max` change also means
+adding that class to `failover.json` first: the workflow names it, so an
+unchanged config leaves the opt-in path unresolvable.
