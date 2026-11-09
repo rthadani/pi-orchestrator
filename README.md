@@ -213,6 +213,20 @@ lazy extension that has not yet registered its tools does not suppress the
 workflow. `ask_user` is optional and never gates anything; the
 one-question-at-a-time rule degrades gracefully without the tool.
 
+### Bundled skill
+
+The package ships one skill, `design-decision-gate`, declared under `pi.skills`
+in `package.json` and loaded from `skills/`. It is the decision gate the
+workflow's design step points at: when a question is warranted at all, how to
+shape the options, and how to avoid over-asking. It needs no install and no
+extension, and it works either way: it prefers the `ask_user` tool when that is
+available and falls back to the same numbered options in plain chat when it is
+not.
+
+It is deliberately **not** named `ask-user`. Pi keeps the first discovered skill
+on a name collision and warns, so a copy named after the upstream one would
+collide with the skill that `pi-ask-user` already ships.
+
 Your own `ORCHESTRATOR.md` is never withheld: when one is present it is
 injected verbatim, exactly as written, regardless of which extensions are
 installed.

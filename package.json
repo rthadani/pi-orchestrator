@@ -34,6 +34,7 @@
   "files": [
     "extensions",
     "assets",
+    "skills",
     "README.md"
   ],
   "peerDependencies": {
@@ -42,6 +43,9 @@
   "pi": {
     "extensions": [
       "./extensions/pi-orchestrator.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   }
 }

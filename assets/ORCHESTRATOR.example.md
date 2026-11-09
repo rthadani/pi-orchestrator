@@ -33,7 +33,12 @@ Follow these rules whenever a task involves designing or changing code here.
    **Grill the user during design.** `oracle` must not guess at open questions
    (scope, trade-offs, constraints, multiple valid approaches); it returns them
    alongside its analysis, and the parent asks one focused question at a time
-   (via `ask_user`), feeding answers back until the design is settled. This
+   (via `ask_user`), feeding answers back until the design is settled. Follow
+   the `design-decision-gate` skill for that step: it sets the bar for when a
+   question is warranted at all, the shape of the options, and the
+   anti-overasking rules. When `ask_user` is not installed, ask in plain chat
+   in the same shape with the recommendation stated, rather than skipping the
+   gate. This
    holds even when `oracle` returns a confident plan: a non-trivial change with
    a genuine open question is asked about before `worker` touches code. For a
    trivial change, do not ask: state the change in one line and implement it.

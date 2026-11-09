@@ -3,9 +3,9 @@
 // extensions/pi-orchestrator.ts with offline fixtures. No framework; throws on
 // failure; prints PASS lines.
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 let failures = 0;
@@ -276,6 +276,99 @@ runCase("CASE 14: shipped asset retains the full workflow detail", () => {
   ]) {
     assert(asset.includes(needle), `asset lost detail: ${needle}`);
   }
+});
+
+runCase("CASE 14b: the bundled design-decision-gate skill is well formed and declared", () => {
+  const skillDir = join(here, "..", "skills", "design-decision-gate");
+  const skillPath = join(skillDir, "SKILL.md");
+  let skill;
+  try {
+    skill = readFileSync(skillPath, "utf8");
+  } catch (e) {
+    assert(false, `skill file absent:\n${skillPath} (${e.message})`);
+  }
+
+  const lines = skill.split("\n");
+  assert(lines[0] === "---", `skill frontmatter must open with a '---' line:\n${lines[0]}`);
+  const closeIdx = lines.indexOf("---", 1);
+  assert(closeIdx > 0, `skill frontmatter must close with a '---' line:\n${skill.slice(0, 200)}`);
+  const frontmatter = lines.slice(1, closeIdx);
+
+  const nameLine = frontmatter.find((line) => line.startsWith("name:"));
+  assert(nameLine !== undefined, `skill frontmatter lacks a name: line:\n${frontmatter.join("\n")}`);
+  const skillName = nameLine.slice("name:".length).trim();
+  assert(
+    skillName === "design-decision-gate",
+    `unexpected skill name:\n${skillName} (expected design-decision-gate)`,
+  );
+  assert(
+    skillName === basename(skillDir),
+    `skill name must match its directory:\n${skillName} vs ${basename(skillDir)}`,
+  );
+  assert(
+    /^[a-z0-9]+(-[a-z0-9]+)*$/.test(skillName),
+    `skill name must be lowercase letters, numbers, and single hyphens:\n${skillName}`,
+  );
+  assert(skillName.length <= 64, `skill name exceeds 64 chars:\n${skillName} (${skillName.length})`);
+
+  const descriptionLine = frontmatter.find((line) => line.startsWith("description:"));
+  assert(
+    descriptionLine !== undefined,
+    `skill frontmatter lacks a description: line:\n${frontmatter.join("\n")}`,
+  );
+  const description = descriptionLine.slice("description:".length).trim().replace(/^"(.*)"$/s, "$1");
+  assert(description.length > 0, `skill description is empty:\n${descriptionLine}`);
+  assert(
+    description.length <= 1024,
+    `skill description exceeds 1024 chars:\n${description.length} chars`,
+  );
+
+  const bodyLines = lines
+    .slice(closeIdx + 1)
+    .join("\n")
+    .split("\n")
+    .filter((line) => line.trim().length > 0);
+  assert(
+    bodyLines.length >= 40,
+    `skill body is too thin, expected at least 40 non-empty lines:\n${bodyLines.length} lines`,
+  );
+
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8"));
+  } catch (e) {
+    assert(false, `package.json is unreadable or invalid JSON:\n${e.message}`);
+  }
+  const declaredSkills = manifest?.pi?.skills;
+  assert(
+    Array.isArray(declaredSkills),
+    `package.json pi.skills must be an array:\n${JSON.stringify(manifest?.pi)}`,
+  );
+  assert(
+    declaredSkills.includes("./skills"),
+    `package.json pi.skills must declare ./skills:\n${JSON.stringify(declaredSkills)}`,
+  );
+  assert(
+    Array.isArray(manifest.files) && manifest.files.includes("skills"),
+    `package.json files must ship the skills directory:\n${JSON.stringify(manifest.files)}`,
+  );
+  const askUserPaths = declaredSkills.filter((entry) => String(entry).includes("ask-user"));
+  assert(
+    askUserPaths.length === 0,
+    `pi.skills must not shadow pi-ask-user's own skill:\n${JSON.stringify(askUserPaths)}`,
+  );
+  const skillDirs = readdirSync(join(here, "..", "skills"), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  assert(
+    !skillDirs.includes("ask-user"),
+    `skills/ must not contain an ask-user skill directory:\n${skillDirs.join(", ")}`,
+  );
+
+  assert(
+    asset.includes("design-decision-gate"),
+    `workflow asset never references the design-decision-gate skill:\n${asset.length} chars`,
+  );
 });
 
 // Exercise the before_agent_start handler with a controlled installed-package
