@@ -32,20 +32,18 @@ Follow these rules whenever a task involves designing or changing code here.
 
    **Grill the user during design.** `oracle` must not guess at open questions
    (scope, trade-offs, constraints, multiple valid approaches); it returns them
-   alongside its analysis, and the parent asks one focused question at a time
-   (via `ask_user`), feeding answers back until the design is settled. Exactly
-   one decision gate is loaded, and it sets the bar for when a question is
-   warranted at all, the shape of the options, and the anti-overasking rules:
+   alongside its analysis, and the parent asks one focused question at a time,
+   feeding answers back until the design is settled. Ask through whichever
+   decision gate is loaded: it sets the bar for when a question is warranted at
+   all, the shape of the options, and the anti-overasking rules. That gate is
    the `ask-user` skill when `ask_user` is available, otherwise the bundled
-   `design-decision-gate` skill, which renders the same policy as plain-chat
-   options. Follow whichever one is present; never both. When `ask_user` is not
-   installed, ask in plain chat in that shape with the recommendation stated,
-   rather than skipping the gate. This
-   holds even when `oracle` returns a confident plan: a non-trivial change with
-   a genuine open question is asked about before `worker` touches code. For a
-   trivial change, do not ask: state the change in one line and implement it.
-   Presenting a plan built on unspoken assumptions counts as a workflow
-   failure.
+   `design-decision-gate` skill. Without the tool the same question is asked in
+   plain chat, in the same shape, with the recommendation stated; skipping the
+   gate is never the alternative. This holds even when `oracle` returns a
+   confident plan: a non-trivial change with a genuine open question is asked
+   about before `worker` touches code. For a trivial change, do not ask: state
+   the change in one line and implement it. Presenting a plan built on unspoken
+   assumptions counts as a workflow failure.
 
    **Plan the parallelism in the plan.** When a change spans more than one
    file area, `oracle` must return a **work partition** alongside its plan:
