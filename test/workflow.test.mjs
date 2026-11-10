@@ -46,6 +46,7 @@ const {
   enforcementEnabled,
   isReadOnlyCommand,
   isSourcePath,
+  decisionGateSkillPaths,
   default: piRoster,
 } = await import("../extensions/pi-orchestrator.ts");
 
@@ -278,7 +279,7 @@ runCase("CASE 14: shipped asset retains the full workflow detail", () => {
   }
 });
 
-runCase("CASE 14b: the bundled design-decision-gate skill is well formed and declared", () => {
+runCase("CASE 14b: the bundled design-decision-gate skill is well formed and gated on ask_user", () => {
   const skillDir = join(here, "..", "skills", "design-decision-gate");
   const skillPath = join(skillDir, "SKILL.md");
   let skill;
@@ -339,14 +340,17 @@ runCase("CASE 14b: the bundled design-decision-gate skill is well formed and dec
   } catch (e) {
     assert(false, `package.json is unreadable or invalid JSON:\n${e.message}`);
   }
-  const declaredSkills = manifest?.pi?.skills;
+  const declaredSkills = manifest?.pi?.skills ?? [];
   assert(
     Array.isArray(declaredSkills),
-    `package.json pi.skills must be an array:\n${JSON.stringify(manifest?.pi)}`,
+    `package.json pi.skills must be an array when present:\n${JSON.stringify(manifest?.pi)}`,
   );
+  // The skill is contributed at runtime so it can be withheld when ask_user
+  // owns the gate. A static pi.skills entry would load it unconditionally and
+  // put two copies of the same handshake in front of the model.
   assert(
-    declaredSkills.includes("./skills"),
-    `package.json pi.skills must declare ./skills:\n${JSON.stringify(declaredSkills)}`,
+    !declaredSkills.some((entry) => String(entry).includes("skills")),
+    `pi.skills must not statically load the fallback gate:\n${JSON.stringify(declaredSkills)}`,
   );
   assert(
     Array.isArray(manifest.files) && manifest.files.includes("skills"),
@@ -368,6 +372,22 @@ runCase("CASE 14b: the bundled design-decision-gate skill is well formed and dec
   assert(
     asset.includes("design-decision-gate"),
     `workflow asset never references the design-decision-gate skill:\n${asset.length} chars`,
+  );
+
+  // Exclusivity: the gate loads only where the ask_user tool is absent.
+  assert(
+    decisionGateSkillPaths(true).length === 0,
+    `gate must not load alongside ask_user:\n${JSON.stringify(decisionGateSkillPaths(true))}`,
+  );
+  const fallback = decisionGateSkillPaths(false);
+  assert(
+    fallback.length === 1 && fallback[0].endsWith("skills"),
+    `gate must load from skills/ when ask_user is absent:\n${JSON.stringify(fallback)}`,
+  );
+  const extensionSource = readFileSync(join(here, "..", "extensions", "pi-orchestrator.ts"), "utf8");
+  assert(
+    extensionSource.includes('pi.on("resources_discover"'),
+    `extension never registers a resources_discover handler for the fallback gate`,
   );
 });
 

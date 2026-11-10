@@ -43,9 +43,6 @@
   "pi": {
     "extensions": [
       "./extensions/pi-orchestrator.ts"
-    ],
-    "skills": [
-      "./skills"
     ]
   }
 }

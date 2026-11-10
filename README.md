@@ -211,17 +211,26 @@ until it is. The check is on installation (pi's settings `packages` plus the
 model registry's `failover` provider), never on runtime tool visibility, so a
 lazy extension that has not yet registered its tools does not suppress the
 workflow. `ask_user` is optional and never gates anything; the
-one-question-at-a-time rule degrades gracefully without the tool.
+one-question-at-a-time rule degrades gracefully without the tool, which is what
+the bundled fallback skill covers.
 
 ### Bundled skill
 
-The package ships one skill, `design-decision-gate`, declared under `pi.skills`
-in `package.json` and loaded from `skills/`. It is the decision gate the
-workflow's design step points at: when a question is warranted at all, how to
-shape the options, and how to avoid over-asking. It needs no install and no
-extension, and it works either way: it prefers the `ask_user` tool when that is
-available and falls back to the same numbered options in plain chat when it is
-not.
+The package ships one skill, `design-decision-gate`, in `skills/`. It is the
+fallback decision gate the workflow's design step points at: when a question is
+warranted at all, how to shape the options, and how to avoid over-asking.
+
+Only one gate is ever loaded. The extension contributes this skill through the
+`resources_discover` hook **only when `ask_user` is absent**, from either the
+runtime tool list or an installed `pi-ask-user` in your settings. With the tool
+present, the `ask-user` skill that `pi-ask-user` ships owns the handshake and
+this package contributes nothing, so you never carry two copies of one policy.
+The fallback renders the same handshake as numbered plain-chat options, which
+keeps the rule alive in `-p` and RPC runs that have no question tool.
+
+Because the skill is contributed at runtime rather than declared under
+`pi.skills`, removing `pi-ask-user` is enough to get the fallback; there is no
+second place to configure.
 
 It is deliberately **not** named `ask-user`. Pi keeps the first discovered skill
 on a name collision and warns, so a copy named after the upstream one would

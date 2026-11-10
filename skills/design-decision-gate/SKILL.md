@@ -12,6 +12,13 @@ Use this skill to force explicit alignment before a consequential decision.
 This skill is about **decision control**, not chit-chat. Its job is to convert
 one real ambiguity into one recorded decision, then get back to work.
 
+**This skill is the fallback, not a second gate.** `pi-orchestrator` contributes
+it only when the `ask_user` tool is absent, so exactly one decision gate is ever
+loaded. If you can see the `ask_user` tool, the `ask-user` skill owns this
+handshake and this file should not be applied; use it instead. Everything below
+is the same policy rendered for plain chat, so the rule survives runs that have
+no question tool at all.
+
 ## Non-negotiable rule
 
 Gate the step before proceeding when **any** of the following is true:
@@ -70,6 +77,10 @@ Prepare a short neutral summary covering:
 Keep it to a short paragraph or a few bullets. No recap of the whole task.
 
 ### 4) Ask one focused question
+
+**Either shape is fine, but only one.** With the `ask_user` tool present, the
+`ask-user` skill owns the handshake and this file does not apply. Without it,
+follow this file. Never run both, and never load both to compare them.
 
 Ask with one decision per turn. Two shapes, depending on what is available.
 

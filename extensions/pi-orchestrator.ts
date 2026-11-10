@@ -128,6 +128,22 @@ function workflowAssetPath(): string {
   return join(dirname(fileURLToPath(import.meta.url)), "..", "assets", "ORCHESTRATOR.example.md");
 }
 
+function bundledSkillsDir(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "skills");
+}
+
+/**
+ * Skill paths this extension contributes, or none.
+ *
+ * Exactly one decision gate is ever loaded. When pi-ask-user is installed its
+ * `ask-user` skill owns the handshake, so contributing a second copy buys
+ * nothing and only drifts; the bundled gate is the fallback for runs where
+ * `ask_user` is absent.
+ */
+export function decisionGateSkillPaths(askUserPresent: boolean, dir: string = bundledSkillsDir()): string[] {
+  return askUserPresent ? [] : [dir];
+}
+
 function buildWorkflow(path: string, source: "user" | "default"): WorkflowState {
   const mtimeMs = mtimeOf(path);
   if (mtimeMs === null) {
@@ -909,6 +925,20 @@ function collectProviderNames(ctx: unknown): ReadonlySet<string> | null {
   }
 }
 
+/**
+ * Whether pi-ask-user owns the decision gate in this process.
+ *
+ * Runtime tool visibility answers it when available; the settings package list
+ * is the fallback for the window before tools register. Either signal saying
+ * "present" suppresses the bundled gate.
+ */
+function askUserAvailable(pi: ExtensionAPI): boolean {
+  const tools = collectToolNames(pi);
+  if (tools !== null && tools.has("ask_user")) return true;
+  const installed = readInstalledPackages(settingsPath());
+  return installed !== null && hasInstalledPackage(installed)("pi-ask-user");
+}
+
 /** Present capabilities, or null when settings or the model registry cannot be probed. */
 export function detectPresent(ctx: unknown): ReadonlySet<string> | null {
   const installed = readInstalledPackages(settingsPath());
@@ -1021,6 +1051,13 @@ export function renderDoctorReport(state: DoctorState): string {
 }
 
 export default function piRoster(pi: ExtensionAPI): void {
+  // Load the bundled decision gate only where `ask_user` is absent, so the
+  // plugin's `ask-user` skill and the bundled gate are mutually exclusive
+  // rather than two copies of one policy.
+  pi.on("resources_discover", () => {
+    return { skillPaths: decisionGateSkillPaths(askUserAvailable(pi)) };
+  });
+
   pi.on("before_agent_start", (event, ctx) => {
     const session = sessionKey(ctx);
     // Only an explicit user-initiated run defines a top-level session. Children
