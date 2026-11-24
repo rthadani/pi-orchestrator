@@ -37,9 +37,12 @@
  * injected only when all four required companion extensions are installed; a
  * missing one withholds it, and a withheld workflow is never enforced.
  *
- * Warning: a class name is not a model string. Pass `failover/<model-name>`;
- * `failover/<class>` does not resolve to that class and falls back to the
- * configured default.
+ * Model routing: pass `failover/<class>`. pi-failover 1.2+ resolves a class
+ * name to that class and starts at its first-listed model in failover.json
+ * order (so `flash` lands on the flash class's first model, not the configured
+ * default). The configured default is only reached by `failover/auto` - the
+ * session model a spawn inherits when `model` is omitted - or by an unknown
+ * id, and no workflow spawn should ever do either.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -627,9 +630,11 @@ export function decideToolGate(input: GateInput): GateDecision {
     reason: [
       `Blocked: ${input.toolName} would change project code (${write.why}).`,
       "The active workflow requires delegation before a code change:",
-      'recon with subagent({ agent: "scout", task: "..." }), design with',
-      'subagent({ agent: "oracle", task: "..." }), then implement with',
-      'subagent({ agent: "worker", task: "..." }). Start with scout or oracle.',
+      'recon with subagent({ agent: "scout", model: "failover/flash",',
+      'task: "..." }), design with subagent({ agent: "oracle", model:',
+      '"failover/sonnet", task: "..." }), then implement with',
+      'subagent({ agent: "worker", model: "failover/<class>", task: "..." }).',
+      "Start with scout or oracle.",
       "Reads, builds, test runs, package installs and config edits never need this.",
     ].join(" "),
   };

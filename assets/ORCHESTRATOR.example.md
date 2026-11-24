@@ -212,9 +212,13 @@ Follow these rules whenever a task involves designing or changing code here.
 Every subagent runs through the `failover` provider (classes defined in
 `~/.pi/agent/failover.json`), so a provider running out of credits fails over
 to the next model in that agent's class instead of stopping the run. Pass the
-model explicitly on every spawn. Fixed assignments: `scout` uses the `flash`
-class (escalate to `sonnet` only for dense or unfamiliar codebases) and
-`researcher` uses the `sonnet` class.
+model explicitly on every spawn as `failover/<class>`: the class resolves to
+the first model listed under it in `failover.json` order, then fails over
+within the class. The config's top-level default model backs only
+`failover/auto` - the session model a spawn inherits when `model` is omitted -
+and no spawn should ever land on it; the class order decides. Fixed
+assignments: `scout` uses the `flash` class (escalate to `sonnet` only for
+dense or unfamiliar codebases) and `researcher` uses the `sonnet` class.
 
 **Triage assigns class for `oracle` and the reviewers.** Before the detailed
 design, spawn `oracle` on the `sonnet` class with a bounded
@@ -248,7 +252,9 @@ roster does not list cannot be spawned: if `coding-max` is absent from
 `failover.json`, send that work to `coding` and say so, rather than passing a
 model name the roster never mentioned.
 
-Always pass a `failover/<name>` string; never a raw provider model id.
+Always pass a `failover/<class>` string - it starts at that class's
+first-listed model in failover.json order. Never a raw provider model id, and
+never `failover/auto`, which resolves to the configured default.
 
 **Reviewer classes: correctness → `sonnet`, tests → `flash`,
 simplicity/style → `flash`.** The tests reviewer is the cheap one: its job is
